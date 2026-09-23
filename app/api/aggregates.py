@@ -186,6 +186,22 @@ async def get_aggregate_alerts():
         if status.data
     }
 
+@router.get("/alerts/pw")
+async def get_aggregate_alerts():
+    """Get per-gateway alert lists, keyed by gateway ID.
+
+    Returns the active alert list from each gateway, keyed by gateway ID.
+    When multiple gateways are configured this lets you see which device
+    generated each alert rather than having them all merged into one list.
+
+    Only gateways with available data are included (offline gateways omitted).
+    """
+    all_gateways = gateway_manager.get_all_gateways()
+    return {
+        gw_id: {alert: 1 for alert in (getattr(status.data, "alerts", []) or [])}
+        for gw_id, status in all_gateways.items()
+        if status and status.data
+    }
 
 @router.get("/vitals")
 async def get_aggregate_vitals():

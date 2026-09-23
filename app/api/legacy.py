@@ -54,7 +54,7 @@ from typing import Optional
 
 import psutil
 import pypowerwall
-from fastapi import APIRouter, HTTPException, Response, Header
+from fastapi import APIRouter, HTTPException, Response, Header, Query
 
 from app.api.auth import verify_control_token
 from app.core.gateway_manager import (
@@ -766,33 +766,49 @@ async def get_alerts_pw():
 
 
 @router.get("/fans")
-async def get_fans():
+async def get_fans(gateway: Optional[str] = Query(default=None)):
     """Get fan speeds in raw format (legacy proxy endpoint).
 
     Uses graceful degradation: returns cached data even if gateway is temporarily offline.
     """
-    gateway_id = get_default_gateway()
-    status = gateway_manager.get_gateway(gateway_id)
+    target_id = gateway or get_default_gateway()
+    status = gateway_manager.get_gateway(target_id)
 
-    if not status or not status.data:
-        return {}
+    if status and status.data and status.data.fan_speeds:
+        return status.data.fan_speeds
 
-    return status.data.fan_speeds or {}
+    # If gateway was not explicitly specified and target has no fan_speeds,
+    # search all configured gateways (e.g. standalone inverter gateway)
+    if not gateway and gateway_manager.gateways:
+        for gw_id in gateway_manager.gateways:
+            gw_status = gateway_manager.get_gateway(gw_id)
+            if gw_status and gw_status.data and gw_status.data.fan_speeds:
+                return gw_status.data.fan_speeds
+
+    return {}
 
 
 @router.get("/fans/pw")
-async def get_fans_pw():
+async def get_fans_pw(gateway: Optional[str] = Query(default=None)):
     """Get fan speeds in simplified format (legacy proxy endpoint).
 
     Uses graceful degradation: returns cached data even if gateway is temporarily offline.
     """
-    gateway_id = get_default_gateway()
-    status = gateway_manager.get_gateway(gateway_id)
+    target_id = gateway or get_default_gateway()
+    status = gateway_manager.get_gateway(target_id)
 
-    if not status or not status.data:
-        return {}
+    fan_speeds = status.data.fan_speeds if status and status.data else None
 
-    fan_speeds = status.data.fan_speeds or {}
+    # If gateway was not explicitly specified and target has no fan_speeds,
+    # search all configured gateways (e.g. standalone inverter gateway)
+    if not fan_speeds and not gateway and gateway_manager.gateways:
+        for gw_id in gateway_manager.gateways:
+            gw_status = gateway_manager.get_gateway(gw_id)
+            if gw_status and gw_status.data and gw_status.data.fan_speeds:
+                fan_speeds = gw_status.data.fan_speeds
+                break
+
+    fan_speeds = fan_speeds or {}
     fans = {}
     for i, (_, value) in enumerate(sorted(fan_speeds.items())):
         key = f"FAN{i+1}"
@@ -2159,8 +2175,9 @@ async def get_stats():
     pw3 = False
     tedapi_mode = None
     siteid = None
-    # Active TEDAPI transport of the first gateway that has reported one,
-    # else the configured defaults. Mirrors the proxy's /stats fields.
+    # Effective TEDAPI transport of the first TEDAPI gateway (active values
+    # once reported, else requested); falls back to the configured defaults
+    # when no gateway speaks TEDAPI. Mirrors the proxy's /stats fields.
     tedapi_auth_mode = None
     tedapi_api_version = None
 
@@ -2197,12 +2214,10 @@ async def get_stats():
         now = datetime.now().timestamp()
         backoff_remaining = max(0, int(next_poll - now))
 
-        gw_data = status.data if status else None
-        active_auth_mode = gw_data.tedapi_auth_mode if gw_data else None
-        active_api_version = gw_data.tedapi_api_version if gw_data else None
-        if tedapi_auth_mode is None and active_auth_mode:
-            tedapi_auth_mode = active_auth_mode
-            tedapi_api_version = active_api_version
+        transport = gateway_manager.tedapi_transport(gateway_id)
+        if tedapi_auth_mode is None and transport["auth_mode"]:
+            tedapi_auth_mode = transport["auth_mode"]
+            tedapi_api_version = transport["api_version"]
 
         gateway_statuses.append(
             {
@@ -2216,12 +2231,12 @@ async def get_stats():
                 else None,
                 "consecutive_failures": failures,
                 "backoff_seconds": backoff_remaining if failures > 0 else 0,
-                # Requested vs active TEDAPI transport (*_active is None until
-                # the live client reports it).
-                "tedapi_auth_mode": gw.tedapi_auth_mode,
-                "tedapi_auth_mode_active": active_auth_mode,
-                "tedapi_api_version": gw.tedapi_api_version,
-                "tedapi_api_version_active": active_api_version,
+                # Requested vs active TEDAPI transport (None for non-TEDAPI
+                # gateways; *_active is None until the first successful poll).
+                "tedapi_auth_mode": transport["requested_auth_mode"],
+                "tedapi_auth_mode_active": transport["active_auth_mode"],
+                "tedapi_api_version": transport["requested_api_version"],
+                "tedapi_api_version_active": transport["active_api_version"],
             }
         )
 

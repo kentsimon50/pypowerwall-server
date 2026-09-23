@@ -87,6 +87,58 @@ async def get_gateway_aggregates(gateway_id: str):
 
     return status.data.aggregates or {}
 
+@router.get("/{gateway_id}/alerts")
+async def get_gateway_alerts(gateway_id: str):
+    """Get alerts for a specific gateway in dictionary format.
+
+    Uses graceful degradation: returns cached data even if gateway is temporarily offline.
+    """
+    status = gateway_manager.get_gateway(gateway_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Gateway {gateway_id} not found")
+
+    if not status.data:
+        return {}
+
+    alerts = getattr(status.data, "alerts", []) or []
+    return {alert: 1 for alert in alerts}
+
+
+@router.get("/{gateway_id}/fans")
+async def get_gateway_fans(gateway_id: str):
+    """Get fan speeds in raw format for a specific gateway.
+
+    Uses graceful degradation: returns cached data even if gateway is temporarily offline.
+    """
+    status = gateway_manager.get_gateway(gateway_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Gateway {gateway_id} not found")
+
+    if not status.data:
+        return {}
+
+    return status.data.fan_speeds or {}
+
+
+@router.get("/{gateway_id}/fans/pw")
+async def get_gateway_fans_pw(gateway_id: str):
+    """Get fan speeds in simplified format for a specific gateway.
+
+    Uses graceful degradation: returns cached data even if gateway is temporarily offline.
+    """
+    status = gateway_manager.get_gateway(gateway_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Gateway {gateway_id} not found")
+
+    fan_speeds = status.data.fan_speeds if status and status.data else None
+    fan_speeds = fan_speeds or {}
+    fans = {}
+    for i, (_, value) in enumerate(sorted(fan_speeds.items())):
+        key = f"FAN{i+1}"
+        if isinstance(value, dict):
+            fans[f"{key}_actual"] = value.get("PVAC_Fan_Speed_Actual_RPM")
+            fans[f"{key}_target"] = value.get("PVAC_Fan_Speed_Target_RPM")
+    return fans
 
 @router.get("/{gateway_id}/api/{path:path}")
 async def proxy_gateway_api(gateway_id: str, path: str):

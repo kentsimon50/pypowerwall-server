@@ -731,11 +731,27 @@ class TimeSeriesStore:
             # Inner query: mean per (bucket, gateway) so multi-gateway setups
             # sum instead of average; outer query collapses to fleet totals
             # (mean SoE). Single-gateway deployments get plain bucket means.
+            # Inverter-only gateways (type: "inverter") are excluded from solar_kw sum.
+            from app.core.gateway_manager import gateway_manager
+
+            inverter_ids = [
+                gw_id
+                for gw_id, gw in gateway_manager.gateways.items()
+                if getattr(gw, "type", "powerwall") == "inverter"
+            ]
+            if inverter_ids and not gateway:
+                inverter_placeholders = ",".join("?" for _ in inverter_ids)
+                solar_select = f"SUM(CASE WHEN gateway_id IN ({inverter_placeholders}) THEN 0 ELSE solar_avg END)/1000.0 AS solar_kw, "
+                extra_params = tuple(inverter_ids)
+            else:
+                solar_select = "SUM(solar_avg)/1000.0 AS solar_kw, "
+                extra_params = ()
+
             gw_filter = "AND gateway_id=? " if gateway else ""
             sql = (
                 "SELECT bstart, "
-                "SUM(solar_avg)/1000.0 AS solar_kw, "
-                "SUM(home_avg)/1000.0 AS home_kw, "
+                + solar_select
+                + "SUM(home_avg)/1000.0 AS home_kw, "
                 "SUM(batt_avg)/1000.0 AS battery_kw, "
                 "SUM(grid_avg)/1000.0 AS grid_kw, "
                 "AVG(soe_avg) AS battery_level "
@@ -752,6 +768,7 @@ class TimeSeriesStore:
             rows = conn.execute(
                 sql,
                 (
+                    *extra_params,
                     bucket,
                     bucket,
                     start,

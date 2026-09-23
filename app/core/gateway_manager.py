@@ -79,6 +79,147 @@ from app.config import GatewayConfig
 
 logger = logging.getLogger(__name__)
 
+# pypowerwall's V2026_06 protobuf modules are generated with a newer gencode
+# than its declared protobuf floor; the library raises an actionable
+# ImportError lazily on first use. Checked up front so the operator sees the
+# fix at startup instead of a permanently failing poll.
+V2026_PROTOBUF_MIN = (6, 33, 6)
+
+
+def _resolve_tedapi_transport(config: GatewayConfig, settings) -> "tuple[str, str]":
+    """Resolve the requested TEDAPI auth mode and API version for a gateway.
+
+    Precedence: per-gateway value > PW_TEDAPI_* global default > library
+    default. Both are coerced leniently (unknown values log a warning and fall
+    back) because pypowerwall.Powerwall() coerces the auth mode *strictly* - a
+    typo would otherwise turn into a poll that fails forever with backoff.
+    Returns the enum values as plain strings.
+    """
+    requested_mode = config.tedapi_auth_mode or settings.tedapi_auth_mode
+    normalised_mode = str(requested_mode or "").strip().lower()
+    try:
+        auth_mode = AuthMode.coerce(normalised_mode)
+    except ValueError:
+        auth_mode = AuthMode.BASIC
+        logger.warning(
+            "Gateway %s: unknown tedapi_auth_mode %r (valid: %s) - using %s",
+            config.id,
+            requested_mode,
+            ", ".join(m.value for m in AuthMode),
+            auth_mode,
+        )
+    requested_version = config.tedapi_api_version or settings.tedapi_api_version
+    normalised_version = str(requested_version or "").strip().upper()
+    try:
+        api_version = TEDAPIApiVersion(normalised_version)
+    except ValueError:
+        api_version = TEDAPIApiVersion.V2024_06
+        logger.warning(
+            "Gateway %s: unknown tedapi_api_version %r (valid: %s) - using %s",
+            config.id,
+            requested_version,
+            ", ".join(v.value for v in TEDAPIApiVersion),
+            api_version,
+        )
+    # Bearer auth requires V2026_06 signed GraphQL queries for TEDAPI (e.g. get_fan_speeds);
+    # auto-promote if the user didn't explicitly override config.tedapi_api_version
+    if auth_mode == AuthMode.BEARER and api_version == TEDAPIApiVersion.V2024_06 and not config.tedapi_api_version:
+        api_version = TEDAPIApiVersion.V2026_06
+    return str(auth_mode), str(api_version)
+
+
+def _extract_tedapi_fan_speeds(tedapi_client) -> Dict[str, Dict[str, Any]]:
+    """Extract fan speed metrics from TEDAPI client.
+
+    First tries pypowerwall's built-in get_fan_speeds() (which searches components.msa).
+    If empty, inspects device controller data for esCan.bus.PVAC logging entries
+    which contain PVAC_Fan_Speed_Actual_RPM and PVAC_Fan_Speed_Target_RPM on Tesla Solar Inverters.
+    """
+    if not tedapi_client or isinstance(tedapi_client, bool):
+        return {}
+
+    fans = None
+    if hasattr(tedapi_client, "get_fan_speeds"):
+        try:
+            fans = tedapi_client.get_fan_speeds()
+        except Exception as e:
+            logger.debug(f"get_fan_speeds() failed: {e}")
+
+    if fans and isinstance(fans, dict):
+        return fans
+
+    # Fallback for Tesla Inverter gateways: inspect get_device_controller()
+    if hasattr(tedapi_client, "get_device_controller"):
+        try:
+            ctrl = tedapi_client.get_device_controller()
+            if isinstance(ctrl, dict):
+                pvac_bus = ctrl.get("esCan", {}).get("bus", {}).get("PVAC", [])
+                if isinstance(pvac_bus, list):
+                    fan_dict = {}
+                    for item in pvac_bus:
+                        if isinstance(item, dict):
+                            logging_data = item.get("PVAC_Logging", {})
+                            if isinstance(logging_data, dict):
+                                actual = logging_data.get("PVAC_Fan_Speed_Actual_RPM")
+                                target = logging_data.get("PVAC_Fan_Speed_Target_RPM")
+                                if actual is not None or target is not None:
+                                    if actual is not None:
+                                        fan_dict["PVAC_Fan_Speed_Actual_RPM"] = actual
+                                    if target is not None:
+                                        fan_dict["PVAC_Fan_Speed_Target_RPM"] = target
+                                    break
+
+                    if fan_dict:
+                        din = None
+                        pv_inverters = ctrl.get("control", {}).get("pvInverters", [])
+                        if isinstance(pv_inverters, list) and pv_inverters:
+                            din = (
+                                pv_inverters[0].get("din")
+                                if isinstance(pv_inverters[0], dict)
+                                else None
+                            )
+
+                        if not din:
+                            components = ctrl.get("components", {})
+                            pvac_comps = (
+                                components.get("pvac", [])
+                                if isinstance(components, dict)
+                                else []
+                            )
+                            if isinstance(pvac_comps, list) and pvac_comps:
+                                pn = pvac_comps[0].get("partNumber")
+                                sn = pvac_comps[0].get("serialNumber")
+                                if pn and sn:
+                                    din = f"{pn}--{sn}"
+                                elif sn:
+                                    din = sn
+
+                        device_key = f"PVAC--{din}" if din else "PVAC--Inverter"
+                        return {device_key: fan_dict}
+        except Exception as e:
+            logger.debug(f"Device controller fan extraction failed: {e}")
+
+    return {}
+
+
+def _protobuf_version() -> Optional["tuple[int, ...]"]:
+    """Installed protobuf runtime version as a tuple, or None if unavailable."""
+    try:
+        from google.protobuf import __version__ as pb_version
+    except Exception:  # pragma: no cover - protobuf is a pypowerwall dependency
+        return None
+    parts = []
+    for piece in pb_version.split("."):
+        digits = ""
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
 # Methods that write gateway state and must not run concurrently.
 # set_operation() always writes backup_reserve_percent + real_mode together,
 # reading the field it wasn't given from the 5-second poll cache. Two
@@ -167,6 +308,11 @@ class GatewayManager:
             str, GatewayConfig
         ] = {}  # Gateways waiting for lazy initialization
         self._preserve_stale_count: Dict[str, int] = {}  # Multi-PW snapshot preservation staleness tracker
+        # Gateways already warned about a requested-vs-active TEDAPI transport
+        # mismatch (e.g. bearer requested but hybrid mode speaks basic), so the
+        # warning is logged once instead of every poll.
+        self._transport_warned: set = set()
+
         # TEDAPI SolarOnly fallback tracking (per gateway).
         # Distinct from _consecutive_failures: is_degraded = transient transport
         # failures; is_fallback_mode = TEDAPI has fallen back to SolarOnly mode
@@ -424,22 +570,15 @@ class GatewayManager:
                 if config.email and not config.host:
                     config.cloud_mode = True
 
-                # Requested TEDAPI transport: per-gateway value, else the
-                # PW_TEDAPI_* default. pypowerwall's own coerce helpers warn
-                # and fall back on a typo (Powerwall() itself would raise), so
-                # a bad value never becomes a permanently failing poll.
-                # pypowerwall honours these only in full TEDAPI mode; /stats
-                # shows the transport the live client actually uses.
-                requested_mode = (
-                    config.tedapi_auth_mode or settings.tedapi_auth_mode or ""
-                ).strip()
-                requested_version = (
-                    config.tedapi_api_version or settings.tedapi_api_version or ""
-                ).strip().upper()
-                tedapi_auth_mode = str(
-                    AuthMode.coerce(requested_mode, default=AuthMode.BASIC)
+                # Requested TEDAPI transport (per-gateway config > PW_TEDAPI_*
+                # defaults), coerced leniently. Warn now where pypowerwall will
+                # ignore the request rather than letting it fail silently.
+                tedapi_auth_mode, tedapi_api_version = _resolve_tedapi_transport(
+                    config, settings
                 )
-                tedapi_api_version = str(TEDAPIApiVersion.coerce(requested_version))
+                self._warn_transport_ignored(
+                    config, basic_lan, tedapi_auth_mode, tedapi_api_version
+                )
 
                 gateway = Gateway(
                     id=config.id,
@@ -864,16 +1003,12 @@ class GatewayManager:
         except Exception:
             pass
 
-        # Active TEDAPI transport as reported by the live client. It can differ
-        # from the requested one (hybrid mode always speaks basic); /stats shows
-        # both. Only real strings are recorded: AuthMode / TEDAPIApiVersion are
-        # str enums, a Mock attribute or a client without the concept is not.
-        active_mode = getattr(getattr(pw, "tedapi", None), "auth_mode", None)
-        if isinstance(active_mode, str):
-            data.tedapi_auth_mode = str(active_mode)
-        active_version = getattr(pw, "tedapi_api_version", None)
-        if isinstance(active_version, str):
-            data.tedapi_api_version = str(active_version)
+        # Record the TEDAPI transport the live client is actually using and
+        # warn (once) if it differs from what was requested.
+        try:
+            self._record_active_transport(gateway_id, pw, data)
+        except Exception as e:
+            logger.debug(f"Transport detection failed for {gateway_id}: {e}")
 
         # Cache TEDAPI config for battery block type enrichment (PW3 systems)
         # battery_blocks[].type gives "Powerwall3" / "Powerwall3Follower" etc.,
@@ -1085,14 +1220,47 @@ class GatewayManager:
                 logger.debug(f"System status not available for {gateway_id}: {e}")
 
         # Try to get fan speeds for /fans endpoint (TEDAPI only)
-        # get_fan_speeds() lives on the TEDAPI client (pw.tedapi),
-        # not on the top-level Powerwall object itself
+        # _extract_tedapi_fan_speeds() inspects get_fan_speeds() and falls back
+        # to esCan.bus.PVAC logging signals for Tesla Solar Inverters over TEDAPI.
         try:
-            if hasattr(pw, "tedapi") and pw.tedapi and hasattr(pw.tedapi, "get_fan_speeds"):
+            tedapi_client = getattr(pw, "tedapi", None) or getattr(
+                getattr(pw, "client", None), "tedapi", None
+            )
+            if tedapi_client and not isinstance(tedapi_client, bool):
                 data.fan_speeds = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, pw.tedapi.get_fan_speeds),
+                    loop.run_in_executor(
+                        self._executor, lambda: _extract_tedapi_fan_speeds(tedapi_client)
+                    ),
                     timeout=step_timeout,
                 )
+                if (
+                    data.fan_speeds
+                    and isinstance(data.fan_speeds, dict)
+                ):
+                    if data.vitals is None:
+                        data.vitals = {}
+                    if isinstance(data.vitals, dict):
+                        for device_key, fans in data.fan_speeds.items():
+                            if isinstance(fans, dict):
+                                if (
+                                    device_key in data.vitals
+                                    and isinstance(data.vitals[device_key], dict)
+                                ):
+                                    data.vitals[device_key].update(fans)
+                                else:
+                                    matched = False
+                                    for v_key, v_val in data.vitals.items():
+                                        if (
+                                            v_key.startswith("PVAC")
+                                            or (
+                                                "--" in device_key
+                                                and device_key.split("--")[-1] in v_key
+                                            )
+                                        ) and isinstance(v_val, dict):
+                                            v_val.update(fans)
+                                            matched = True
+                                    if not matched:
+                                        data.vitals[device_key] = dict(fans)
         except (asyncio.TimeoutError, Exception) as e:
             logger.debug(f"Fan speeds not available for {gateway_id}: {e}")
 
@@ -1207,16 +1375,21 @@ class GatewayManager:
                             "timeout": settings.timeout,
                             "poolmaxsize": settings.pool_maxsize,
                             "pwcacheexpire": pwcacheexpire,
-                            # Requested TEDAPI transport (pypowerwall ignores
-                            # these outside full TEDAPI mode).
+                            # Requested TEDAPI transport. pypowerwall honours
+                            # both only in full-TEDAPI mode (host + gw_pwd, no
+                            # password) and the API version additionally in
+                            # v1r mode; other modes ignore them (warned at
+                            # registration).
                             "tedapi_auth_mode": self.gateways[gateway_id].tedapi_auth_mode,
                             "tedapi_api_version": self.gateways[gateway_id].tedapi_api_version,
                         }
-                        # Per-gateway password (PW_GATEWAYS/config file) or the
-                        # legacy PW_PASSWORD env var. Without gw_pwd/rsa_key this
-                        # selects pypowerwall's local client (PW3 Basic LAN /
-                        # PW2 local mode); alongside gw_pwd it selects hybrid.
-                        local_password = config.password or settings.pw_password
+                        # Per-gateway password (PW_GATEWAYS/config file).
+                        # Only fall back to global settings.pw_password if gw_pwd is NOT set
+                        # and config.type is NOT "inverter", because pypowerwall requires password
+                        # to be empty to activate Full TEDAPI mode (which enables bearer auth and V2026_06 queries).
+                        local_password = config.password
+                        if not local_password and not config.gw_pwd and config.type != "inverter":
+                            local_password = settings.pw_password
                         if local_password:
                             tedapi_kwargs["password"] = local_password
                         if config.email:
@@ -1767,6 +1940,13 @@ class GatewayManager:
         from app.config import settings
 
         status = self.cache.get(gateway_id)
+        if not status and gateway_id:
+            gid_lower = gateway_id.lower()
+            for k, v in self.cache.items():
+                if k.lower() == gid_lower:
+                    status = v
+                    gateway_id = k
+                    break
         if not status:
             return None
 
@@ -1827,7 +2007,13 @@ class GatewayManager:
 
     def get_connection(self, gateway_id: str) -> Optional[pypowerwall.Powerwall]:
         """Get pypowerwall connection for a gateway."""
-        return self.connections.get(gateway_id)
+        conn = self.connections.get(gateway_id)
+        if not conn and gateway_id:
+            gid_lower = gateway_id.lower()
+            for k, v in self.connections.items():
+                if k.lower() == gid_lower:
+                    return v
+        return conn
 
     async def call_api(
         self,
@@ -1865,6 +2051,13 @@ class GatewayManager:
             grid_status = await gateway_manager.call_api('default', 'grid_status', timeout=3.0)
             reserve = await gateway_manager.call_api('default', 'get_reserve')
         """
+        if gateway_id not in self.gateways and gateway_id:
+            gid_lower = gateway_id.lower()
+            for k in self.gateways:
+                if k.lower() == gid_lower:
+                    gateway_id = k
+                    break
+
         # Fast-fail if gateway is offline
         if fail_if_offline:
             status = self.cache.get(gateway_id)
@@ -1874,7 +2067,7 @@ class GatewayManager:
                 )
                 return None
 
-        pw = self.connections.get(gateway_id)
+        pw = self.get_connection(gateway_id)
         if not pw:
             logger.warning(f"[{gateway_id}] call_api({method}): no connection object")
             return None
@@ -2219,6 +2412,170 @@ class GatewayManager:
             logger.warning(f"[{gateway_id}] call_tedapi({method}) error: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # TEDAPI transport (auth mode / API version) bookkeeping
+    # ------------------------------------------------------------------
+
+    def _warn_transport_ignored(
+        self,
+        config: GatewayConfig,
+        basic_lan: bool,
+        auth_mode: str,
+        api_version: str,
+    ) -> None:
+        """Log where pypowerwall will not honour the requested transport.
+
+        pypowerwall.Powerwall() forwards ``tedapi_auth_mode`` only when it
+        builds the full TEDAPI client (host + gw_pwd, no customer password)
+        and ``tedapi_api_version`` in that mode plus TEDAPI v1r. Basic LAN,
+        hybrid (gw_pwd + password) and cloud/FleetAPI gateways never see
+        either value, and v1r rejects bearer outright - so say so at
+        registration instead of leaving the operator to wonder why /stats
+        still reports "basic".
+        """
+        from app.config import settings
+
+        wants_bearer = auth_mode == str(AuthMode.BEARER)
+        wants_v2026 = api_version != str(TEDAPIApiVersion.V2024_06)
+        if not (wants_bearer or wants_v2026):
+            return
+
+        effective_password = config.password
+        if not effective_password and not config.gw_pwd and config.type != "inverter":
+            effective_password = settings.pw_password
+
+        hybrid = bool(
+            config.host and config.gw_pwd and effective_password
+        )
+        if config.cloud_mode or config.fleetapi or not config.host:
+            reason = "cloud/FleetAPI gateways do not use TEDAPI"
+        elif basic_lan:
+            reason = "Basic LAN mode uses pypowerwall's local client"
+        elif hybrid:
+            reason = (
+                "hybrid mode (gw_pwd + password) uses pypowerwall's local client"
+            )
+        elif config.rsa_key_path and wants_bearer:
+            reason = "TEDAPI v1r (rsa_key_path) is incompatible with bearer auth"
+        else:
+            reason = None
+
+        if reason:
+            ignored = []
+            if wants_bearer:
+                ignored.append(f"tedapi_auth_mode={auth_mode}")
+            if wants_v2026 and not (config.rsa_key_path and wants_bearer):
+                ignored.append(f"tedapi_api_version={api_version}")
+            logger.warning(
+                "Gateway %s: %s is ignored - %s",
+                config.id,
+                ", ".join(ignored),
+                reason,
+            )
+
+        if wants_v2026 and not (config.cloud_mode or config.fleetapi):
+            installed = _protobuf_version()
+            if installed is not None and installed < V2026_PROTOBUF_MIN:
+                logger.warning(
+                    "Gateway %s: tedapi_api_version=%s needs protobuf >= %s "
+                    "but %s is installed - TEDAPI queries will fail until you "
+                    "run: pip install 'protobuf>=%s'",
+                    config.id,
+                    api_version,
+                    ".".join(map(str, V2026_PROTOBUF_MIN)),
+                    ".".join(map(str, installed)),
+                    ".".join(map(str, V2026_PROTOBUF_MIN)),
+                )
+
+    def _record_active_transport(self, gateway_id: str, pw, data: PowerwallData) -> None:
+        """Capture the live client's TEDAPI auth mode / API version.
+
+        Warns once per gateway when the active values differ from the
+        requested ones (mirrors the proxy's /stats mismatch warning), or when
+        bearer was requested on a Powerwall 3 (unsupported: use rsa_key_path).
+        """
+        tedapi = getattr(pw, "tedapi", None)
+        active_mode = getattr(tedapi, "auth_mode", None) if tedapi else None
+        # AuthMode / TEDAPIApiVersion are str enums; anything else (e.g. a
+        # Mock attribute, or a client without the concept) is ignored.
+        if isinstance(active_mode, str):
+            data.tedapi_auth_mode = str(active_mode)
+        active_version = getattr(pw, "tedapi_api_version", None)
+        if isinstance(active_version, str):
+            data.tedapi_api_version = str(active_version)
+
+        gateway = self.gateways.get(gateway_id)
+        if gateway is None or gateway_id in self._transport_warned:
+            return
+        if data.tedapi_auth_mode and data.tedapi_auth_mode != gateway.tedapi_auth_mode:
+            logger.warning(
+                "Gateway %s: requested tedapi_auth_mode=%s but the active "
+                "TEDAPI client uses %s",
+                gateway_id,
+                gateway.tedapi_auth_mode,
+                data.tedapi_auth_mode,
+            )
+            self._transport_warned.add(gateway_id)
+        elif data.pw3 and gateway.tedapi_auth_mode == str(AuthMode.BEARER):
+            logger.warning(
+                "Gateway %s: tedapi_auth_mode=bearer is not supported on "
+                "Powerwall 3 - use rsa_key_path (TEDAPI v1r) for wired access",
+                gateway_id,
+            )
+            self._transport_warned.add(gateway_id)
+        elif (
+            data.tedapi_api_version
+            and data.tedapi_api_version != gateway.tedapi_api_version
+        ):
+            logger.warning(
+                "Gateway %s: requested tedapi_api_version=%s but the active "
+                "client uses %s",
+                gateway_id,
+                gateway.tedapi_api_version,
+                data.tedapi_api_version,
+            )
+            self._transport_warned.add(gateway_id)
+
+    def tedapi_transport(self, gateway_id: str) -> Dict[str, Optional[str]]:
+        """Requested vs active TEDAPI transport for a gateway.
+
+        Keys: ``requested_auth_mode`` / ``requested_api_version`` (resolved
+        configuration), ``active_auth_mode`` / ``active_api_version`` (as
+        reported by the live client, None until the first successful poll)
+        and ``auth_mode`` / ``api_version`` (active if known, else requested).
+        Every value is None for gateways that do not speak TEDAPI (cloud,
+        FleetAPI, Basic LAN).
+        """
+        keys = (
+            "requested_auth_mode",
+            "requested_api_version",
+            "active_auth_mode",
+            "active_api_version",
+            "auth_mode",
+            "api_version",
+        )
+        gateway = self.gateways.get(gateway_id)
+        if (
+            gateway is None
+            or not gateway.host
+            or gateway.basic_lan
+            or gateway.cloud_mode
+            or gateway.fleetapi
+        ):
+            return {key: None for key in keys}
+        status = self.cache.get(gateway_id)
+        data = status.data if status else None
+        active_mode = data.tedapi_auth_mode if data else None
+        active_version = data.tedapi_api_version if data else None
+        return {
+            "requested_auth_mode": gateway.tedapi_auth_mode,
+            "requested_api_version": gateway.tedapi_api_version,
+            "active_auth_mode": active_mode,
+            "active_api_version": active_version,
+            "auth_mode": active_mode or gateway.tedapi_auth_mode,
+            "api_version": active_version or gateway.tedapi_api_version,
+        }
+
     def get_aggregate_data(self) -> AggregateData:
         """Get aggregated data from all gateways.
 
@@ -2289,7 +2646,8 @@ class GatewayManager:
                 aggregate.total_site_power += site_power
                 aggregate.total_battery_power += battery_power
                 aggregate.total_load_power += load_power
-                aggregate.total_solar_power += solar_power
+                if status.gateway and status.gateway.type != "inverter":
+                    aggregate.total_solar_power += solar_power
 
             aggregate.gateways[gateway_id] = status
 
