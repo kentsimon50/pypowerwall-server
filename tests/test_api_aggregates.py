@@ -238,3 +238,32 @@ def test_aggregate_battery_exposes_scaled_and_raw(client, connected_gateway):
     data = response.json()
     assert data["battery_percent"] == pytest.approx(raw_to_tesla_battery_percent(85.5))
     assert data["battery_percent_raw"] == 85.5
+
+
+def test_aggregate_total_solar_excludes_inverter(mock_gateway_manager, two_gateways):
+    """total_solar_power aggregate sum only includes powerwall gateways when powerwalls exist."""
+    # two_gateways fixture creates "home" (powerwall) and "south" (inverter),
+    # both with solar instant_power = mock_pypowerwall.poll.return_value["solar"]["instant_power"]
+    pw_solar = two_gateways["home"].data.aggregates["solar"]["instant_power"]
+    agg = mock_gateway_manager.get_aggregate_data()
+    # total_solar_power must equal the powerwall gateway's solar (pw_solar), not double (pw_solar * 2)
+    assert agg.total_solar_power == pytest.approx(pw_solar)
+
+
+def test_aggregate_total_solar_includes_inverter_when_no_powerwalls(mock_gateway_manager, mock_pypowerwall):
+    """total_solar_power aggregate sum includes inverter solar when no Powerwalls exist."""
+    gw = Gateway(id="inv", name="Inverter Only", host="10.0.0.1", gw_pwd="pw", type="inverter")
+    data = PowerwallData(
+        aggregates={"solar": {"instant_power": 3500.0}},
+        soe_raw=0.0,
+        soe=0.0,
+        timestamp=1234567890.0,
+    )
+    status = GatewayStatus(gateway=gw, data=data, online=True, last_updated=1234567890.0)
+    mock_gateway_manager.gateways["inv"] = gw
+    mock_gateway_manager.cache["inv"] = status
+
+    agg = mock_gateway_manager.get_aggregate_data()
+    assert agg.total_solar_power == pytest.approx(3500.0)
+
+

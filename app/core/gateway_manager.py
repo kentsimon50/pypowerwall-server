@@ -85,6 +85,29 @@ logger = logging.getLogger(__name__)
 # fix at startup instead of a permanently failing poll.
 V2026_PROTOBUF_MIN = (6, 33, 6)
 
+# Methods that write gateway state and must not run concurrently.
+# set_operation() always writes backup_reserve_percent + real_mode together,
+# reading the field it wasn't given from the 5-second poll cache. Two
+# concurrent writes both see the same stale cache value and the last one to
+# land on the gateway clobbers whichever field it didn't own.
+_WRITE_METHODS = frozenset(
+    {
+        "set_reserve",
+        "set_mode",
+        "set_operation",
+        "set_grid_charging",
+        "set_grid_export",
+        "go_off_grid",
+        "reconnect_grid",
+        # Raw POST is the control fallback for v1r/cloud-mode/FleetAPI
+        # gateways (e.g. post("/api/operation", ...)). It targets the same
+        # Tesla site as the set_* methods, so it must hold the same lock or
+        # the read-modify-write race the lock prevents stays open on the
+        # fallback path.
+        "post",
+    }
+)
+
 
 def _resolve_tedapi_transport(config: GatewayConfig, settings) -> "tuple[str, str]":
     """Resolve the requested TEDAPI auth mode and API version for a gateway.
@@ -199,9 +222,6 @@ def _extract_tedapi_fan_speeds(tedapi_client) -> Dict[str, Dict[str, Any]]:
         except Exception as e:
             logger.debug(f"Device controller fan extraction failed: {e}")
 
-    return {}
-
-
 def _protobuf_version() -> Optional["tuple[int, ...]"]:
     """Installed protobuf runtime version as a tuple, or None if unavailable."""
     try:
@@ -219,29 +239,6 @@ def _protobuf_version() -> Optional["tuple[int, ...]"]:
             break
         parts.append(int(digits))
     return tuple(parts) or None
-
-# Methods that write gateway state and must not run concurrently.
-# set_operation() always writes backup_reserve_percent + real_mode together,
-# reading the field it wasn't given from the 5-second poll cache. Two
-# concurrent writes both see the same stale cache value and the last one to
-# land on the gateway clobbers whichever field it didn't own.
-_WRITE_METHODS = frozenset(
-    {
-        "set_reserve",
-        "set_mode",
-        "set_operation",
-        "set_grid_charging",
-        "set_grid_export",
-        "go_off_grid",
-        "reconnect_grid",
-        # Raw POST is the control fallback for v1r/cloud-mode/FleetAPI
-        # gateways (e.g. post("/api/operation", ...)). It targets the same
-        # Tesla site as the set_* methods, so it must hold the same lock or
-        # the read-modify-write race the lock prevents stays open on the
-        # fallback path.
-        "post",
-    }
-)
 
 
 _ISLANDING_METHODS = frozenset({"go_off_grid", "reconnect_grid"})
@@ -570,9 +567,12 @@ class GatewayManager:
                 if config.email and not config.host:
                     config.cloud_mode = True
 
-                # Requested TEDAPI transport (per-gateway config > PW_TEDAPI_*
-                # defaults), coerced leniently. Warn now where pypowerwall will
-                # ignore the request rather than letting it fail silently.
+                # Requested TEDAPI transport: per-gateway value, else the
+                # PW_TEDAPI_* default. pypowerwall's own coerce helpers warn
+                # and fall back on a typo (Powerwall() itself would raise), so
+                # a bad value never becomes a permanently failing poll.
+                # pypowerwall honours these only in full TEDAPI mode; /stats
+                # shows the transport the live client actually uses.
                 tedapi_auth_mode, tedapi_api_version = _resolve_tedapi_transport(
                     config, settings
                 )
@@ -1003,12 +1003,18 @@ class GatewayManager:
         except Exception:
             pass
 
-        # Record the TEDAPI transport the live client is actually using and
-        # warn (once) if it differs from what was requested.
-        try:
-            self._record_active_transport(gateway_id, pw, data)
-        except Exception as e:
-            logger.debug(f"Transport detection failed for {gateway_id}: {e}")
+        # Active TEDAPI transport as reported by the live client. It can differ
+        # from the requested one (hybrid mode always speaks basic); /stats shows
+        # both. Only real strings are recorded: AuthMode / TEDAPIApiVersion are
+        # str enums, a Mock attribute or a client without the concept is not.
+        active_mode = getattr(getattr(pw, "tedapi", None), "auth_mode", None)
+        if isinstance(active_mode, str):
+            data.tedapi_auth_mode = str(active_mode)
+        active_version = getattr(pw, "tedapi_api_version", None)
+        if isinstance(active_version, str):
+            data.tedapi_api_version = str(active_version)
+
+        self._record_active_transport(gateway_id, pw, data)
 
         # Cache TEDAPI config for battery block type enrichment (PW3 systems)
         # battery_blocks[].type gives "Powerwall3" / "Powerwall3Follower" etc.,
@@ -1240,27 +1246,16 @@ class GatewayManager:
                     if data.vitals is None:
                         data.vitals = {}
                     if isinstance(data.vitals, dict):
-                        for device_key, fans in data.fan_speeds.items():
-                            if isinstance(fans, dict):
-                                if (
-                                    device_key in data.vitals
-                                    and isinstance(data.vitals[device_key], dict)
-                                ):
-                                    data.vitals[device_key].update(fans)
-                                else:
-                                    matched = False
-                                    for v_key, v_val in data.vitals.items():
-                                        if (
-                                            v_key.startswith("PVAC")
-                                            or (
-                                                "--" in device_key
-                                                and device_key.split("--")[-1] in v_key
-                                            )
-                                        ) and isinstance(v_val, dict):
-                                            v_val.update(fans)
-                                            matched = True
-                                    if not matched:
-                                        data.vitals[device_key] = dict(fans)
+                        merged_vitals = dict(data.vitals)
+                        for fan_dev_key, fan_metrics in data.fan_speeds.items():
+                            if isinstance(fan_metrics, dict):
+                                existing_dev = merged_vitals.get(fan_dev_key, {})
+                                if not isinstance(existing_dev, dict):
+                                    existing_dev = {}
+                                dev_copy = dict(existing_dev)
+                                dev_copy.update(fan_metrics)
+                                merged_vitals[fan_dev_key] = dev_copy
+                        data.vitals = merged_vitals
         except (asyncio.TimeoutError, Exception) as e:
             logger.debug(f"Fan speeds not available for {gateway_id}: {e}")
 
@@ -1375,21 +1370,16 @@ class GatewayManager:
                             "timeout": settings.timeout,
                             "poolmaxsize": settings.pool_maxsize,
                             "pwcacheexpire": pwcacheexpire,
-                            # Requested TEDAPI transport. pypowerwall honours
-                            # both only in full-TEDAPI mode (host + gw_pwd, no
-                            # password) and the API version additionally in
-                            # v1r mode; other modes ignore them (warned at
-                            # registration).
+                            # Requested TEDAPI transport (pypowerwall ignores
+                            # these outside full TEDAPI mode).
                             "tedapi_auth_mode": self.gateways[gateway_id].tedapi_auth_mode,
                             "tedapi_api_version": self.gateways[gateway_id].tedapi_api_version,
                         }
-                        # Per-gateway password (PW_GATEWAYS/config file).
-                        # Only fall back to global settings.pw_password if gw_pwd is NOT set
-                        # and config.type is NOT "inverter", because pypowerwall requires password
-                        # to be empty to activate Full TEDAPI mode (which enables bearer auth and V2026_06 queries).
-                        local_password = config.password
-                        if not local_password and not config.gw_pwd and config.type != "inverter":
-                            local_password = settings.pw_password
+                        # Per-gateway password (PW_GATEWAYS/config file) or the
+                        # legacy PW_PASSWORD env var. Without gw_pwd/rsa_key this
+                        # selects pypowerwall's local client (PW3 Basic LAN /
+                        # PW2 local mode); alongside gw_pwd it selects hybrid.
+                        local_password = config.password or settings.pw_password
                         if local_password:
                             tedapi_kwargs["password"] = local_password
                         if config.email:
@@ -1945,7 +1935,6 @@ class GatewayManager:
             for k, v in self.cache.items():
                 if k.lower() == gid_lower:
                     status = v
-                    gateway_id = k
                     break
         if not status:
             return None
@@ -2051,16 +2040,9 @@ class GatewayManager:
             grid_status = await gateway_manager.call_api('default', 'grid_status', timeout=3.0)
             reserve = await gateway_manager.call_api('default', 'get_reserve')
         """
-        if gateway_id not in self.gateways and gateway_id:
-            gid_lower = gateway_id.lower()
-            for k in self.gateways:
-                if k.lower() == gid_lower:
-                    gateway_id = k
-                    break
-
         # Fast-fail if gateway is offline
         if fail_if_offline:
-            status = self.cache.get(gateway_id)
+            status = self.get_gateway(gateway_id)
             if status and not status.online:
                 logger.debug(
                     f"[{gateway_id}] call_api({method}) fast-fail: gateway offline"
@@ -2148,6 +2130,73 @@ class GatewayManager:
             "last_known_grid_charging_time": self._cloud_grid_charging_time,
             "last_known_grid_export": self._cloud_grid_export,
             "last_known_grid_export_time": self._cloud_grid_export_time,
+        }
+
+    def _record_active_transport(
+        self, gateway_id: str, pw: pypowerwall.Powerwall, data: PowerwallData
+    ) -> None:
+        """Record live client active transport and log one-shot warnings."""
+        active_mode = getattr(getattr(pw, "tedapi", None), "auth_mode", None)
+        if isinstance(active_mode, str):
+            data.tedapi_auth_mode = str(active_mode)
+        active_version = getattr(pw, "tedapi_api_version", None)
+        if isinstance(active_version, str):
+            data.tedapi_api_version = str(active_version)
+
+        if not data.tedapi_auth_mode:
+            return
+        gw = self.gateways.get(gateway_id)
+        if not gw:
+            return
+        if (
+            gw.tedapi_auth_mode == "bearer"
+            and data.tedapi_auth_mode != "bearer"
+            and gateway_id not in self._transport_warned
+        ):
+            self._transport_warned.add(gateway_id)
+            logger.warning(
+                "Gateway %s: requested tedapi_auth_mode=bearer but the active transport is %s",
+                gateway_id,
+                data.tedapi_auth_mode,
+            )
+        if (
+            gw.tedapi_auth_mode == "bearer"
+            and data.pw3
+            and gateway_id not in self._transport_warned
+        ):
+            self._transport_warned.add(gateway_id)
+            logger.warning(
+                "Gateway %s: tedapi_auth_mode=bearer is not supported on Powerwall 3",
+                gateway_id,
+            )
+
+    def tedapi_transport(self, gateway_id: str) -> Optional[Dict[str, Any]]:
+        """Get TEDAPI transport status for a gateway (requested vs active).
+
+        Returns None for non-TEDAPI gateways (cloud/FleetAPI/Basic LAN) or unknown IDs.
+        """
+        gw = self.gateways.get(gateway_id)
+        if not gw or gw.cloud_mode or gw.fleetapi or gw.basic_lan:
+            return {
+                "auth_mode": None,
+                "api_version": None,
+                "requested_auth_mode": None,
+                "requested_api_version": None,
+                "active_auth_mode": None,
+                "active_api_version": None,
+            }
+        status = self.cache.get(gateway_id)
+        active_mode = status.data.tedapi_auth_mode if status and status.data else None
+        active_version = status.data.tedapi_api_version if status and status.data else None
+        effective_mode = active_mode or gw.tedapi_auth_mode
+        effective_version = active_version or gw.tedapi_api_version
+        return {
+            "auth_mode": effective_mode,
+            "api_version": effective_version,
+            "requested_auth_mode": gw.tedapi_auth_mode,
+            "requested_api_version": gw.tedapi_api_version,
+            "active_auth_mode": active_mode,
+            "active_api_version": active_version,
         }
 
     async def cloud_control(
@@ -2412,170 +2461,6 @@ class GatewayManager:
             logger.warning(f"[{gateway_id}] call_tedapi({method}) error: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # TEDAPI transport (auth mode / API version) bookkeeping
-    # ------------------------------------------------------------------
-
-    def _warn_transport_ignored(
-        self,
-        config: GatewayConfig,
-        basic_lan: bool,
-        auth_mode: str,
-        api_version: str,
-    ) -> None:
-        """Log where pypowerwall will not honour the requested transport.
-
-        pypowerwall.Powerwall() forwards ``tedapi_auth_mode`` only when it
-        builds the full TEDAPI client (host + gw_pwd, no customer password)
-        and ``tedapi_api_version`` in that mode plus TEDAPI v1r. Basic LAN,
-        hybrid (gw_pwd + password) and cloud/FleetAPI gateways never see
-        either value, and v1r rejects bearer outright - so say so at
-        registration instead of leaving the operator to wonder why /stats
-        still reports "basic".
-        """
-        from app.config import settings
-
-        wants_bearer = auth_mode == str(AuthMode.BEARER)
-        wants_v2026 = api_version != str(TEDAPIApiVersion.V2024_06)
-        if not (wants_bearer or wants_v2026):
-            return
-
-        effective_password = config.password
-        if not effective_password and not config.gw_pwd and config.type != "inverter":
-            effective_password = settings.pw_password
-
-        hybrid = bool(
-            config.host and config.gw_pwd and effective_password
-        )
-        if config.cloud_mode or config.fleetapi or not config.host:
-            reason = "cloud/FleetAPI gateways do not use TEDAPI"
-        elif basic_lan:
-            reason = "Basic LAN mode uses pypowerwall's local client"
-        elif hybrid:
-            reason = (
-                "hybrid mode (gw_pwd + password) uses pypowerwall's local client"
-            )
-        elif config.rsa_key_path and wants_bearer:
-            reason = "TEDAPI v1r (rsa_key_path) is incompatible with bearer auth"
-        else:
-            reason = None
-
-        if reason:
-            ignored = []
-            if wants_bearer:
-                ignored.append(f"tedapi_auth_mode={auth_mode}")
-            if wants_v2026 and not (config.rsa_key_path and wants_bearer):
-                ignored.append(f"tedapi_api_version={api_version}")
-            logger.warning(
-                "Gateway %s: %s is ignored - %s",
-                config.id,
-                ", ".join(ignored),
-                reason,
-            )
-
-        if wants_v2026 and not (config.cloud_mode or config.fleetapi):
-            installed = _protobuf_version()
-            if installed is not None and installed < V2026_PROTOBUF_MIN:
-                logger.warning(
-                    "Gateway %s: tedapi_api_version=%s needs protobuf >= %s "
-                    "but %s is installed - TEDAPI queries will fail until you "
-                    "run: pip install 'protobuf>=%s'",
-                    config.id,
-                    api_version,
-                    ".".join(map(str, V2026_PROTOBUF_MIN)),
-                    ".".join(map(str, installed)),
-                    ".".join(map(str, V2026_PROTOBUF_MIN)),
-                )
-
-    def _record_active_transport(self, gateway_id: str, pw, data: PowerwallData) -> None:
-        """Capture the live client's TEDAPI auth mode / API version.
-
-        Warns once per gateway when the active values differ from the
-        requested ones (mirrors the proxy's /stats mismatch warning), or when
-        bearer was requested on a Powerwall 3 (unsupported: use rsa_key_path).
-        """
-        tedapi = getattr(pw, "tedapi", None)
-        active_mode = getattr(tedapi, "auth_mode", None) if tedapi else None
-        # AuthMode / TEDAPIApiVersion are str enums; anything else (e.g. a
-        # Mock attribute, or a client without the concept) is ignored.
-        if isinstance(active_mode, str):
-            data.tedapi_auth_mode = str(active_mode)
-        active_version = getattr(pw, "tedapi_api_version", None)
-        if isinstance(active_version, str):
-            data.tedapi_api_version = str(active_version)
-
-        gateway = self.gateways.get(gateway_id)
-        if gateway is None or gateway_id in self._transport_warned:
-            return
-        if data.tedapi_auth_mode and data.tedapi_auth_mode != gateway.tedapi_auth_mode:
-            logger.warning(
-                "Gateway %s: requested tedapi_auth_mode=%s but the active "
-                "TEDAPI client uses %s",
-                gateway_id,
-                gateway.tedapi_auth_mode,
-                data.tedapi_auth_mode,
-            )
-            self._transport_warned.add(gateway_id)
-        elif data.pw3 and gateway.tedapi_auth_mode == str(AuthMode.BEARER):
-            logger.warning(
-                "Gateway %s: tedapi_auth_mode=bearer is not supported on "
-                "Powerwall 3 - use rsa_key_path (TEDAPI v1r) for wired access",
-                gateway_id,
-            )
-            self._transport_warned.add(gateway_id)
-        elif (
-            data.tedapi_api_version
-            and data.tedapi_api_version != gateway.tedapi_api_version
-        ):
-            logger.warning(
-                "Gateway %s: requested tedapi_api_version=%s but the active "
-                "client uses %s",
-                gateway_id,
-                gateway.tedapi_api_version,
-                data.tedapi_api_version,
-            )
-            self._transport_warned.add(gateway_id)
-
-    def tedapi_transport(self, gateway_id: str) -> Dict[str, Optional[str]]:
-        """Requested vs active TEDAPI transport for a gateway.
-
-        Keys: ``requested_auth_mode`` / ``requested_api_version`` (resolved
-        configuration), ``active_auth_mode`` / ``active_api_version`` (as
-        reported by the live client, None until the first successful poll)
-        and ``auth_mode`` / ``api_version`` (active if known, else requested).
-        Every value is None for gateways that do not speak TEDAPI (cloud,
-        FleetAPI, Basic LAN).
-        """
-        keys = (
-            "requested_auth_mode",
-            "requested_api_version",
-            "active_auth_mode",
-            "active_api_version",
-            "auth_mode",
-            "api_version",
-        )
-        gateway = self.gateways.get(gateway_id)
-        if (
-            gateway is None
-            or not gateway.host
-            or gateway.basic_lan
-            or gateway.cloud_mode
-            or gateway.fleetapi
-        ):
-            return {key: None for key in keys}
-        status = self.cache.get(gateway_id)
-        data = status.data if status else None
-        active_mode = data.tedapi_auth_mode if data else None
-        active_version = data.tedapi_api_version if data else None
-        return {
-            "requested_auth_mode": gateway.tedapi_auth_mode,
-            "requested_api_version": gateway.tedapi_api_version,
-            "active_auth_mode": active_mode,
-            "active_api_version": active_version,
-            "auth_mode": active_mode or gateway.tedapi_auth_mode,
-            "api_version": active_version or gateway.tedapi_api_version,
-        }
-
     def get_aggregate_data(self) -> AggregateData:
         """Get aggregated data from all gateways.
 
@@ -2606,7 +2491,18 @@ class GatewayManager:
         # way it does for the legacy endpoints — otherwise a brief outage makes
         # aggregate totals dip to zero while /aggregates still shows steady
         # power from the stale-within-TTL snapshot.
-        for gateway_id, status in self.get_all_gateways().items():
+        all_gateways = self.get_all_gateways()
+
+        # Check if any Powerwall (non-inverter) gateways are present.
+        # If Powerwalls exist alongside inverter(s), inverter solar is excluded
+        # to avoid double-counting solar already measured by Powerwall CTs.
+        # If ONLY inverter gateways exist (no Powerwalls), inverter solar is included.
+        has_powerwalls = any(
+            status.gateway and status.gateway.type != "inverter"
+            for status in all_gateways.values()
+        )
+
+        for gateway_id, status in all_gateways.items():
             aggregate.num_gateways += 1
 
             if not status.data:
@@ -2646,7 +2542,13 @@ class GatewayManager:
                 aggregate.total_site_power += site_power
                 aggregate.total_battery_power += battery_power
                 aggregate.total_load_power += load_power
-                if status.gateway and status.gateway.type != "inverter":
+                # Solar generation on standalone solar-inverter gateways
+                # (type: "inverter") is excluded from the aggregate sum if
+                # Powerwall gateways are present, to prevent double-counting
+                # solar already measured by Powerwall CTs.
+                if not has_powerwalls or (
+                    status.gateway and status.gateway.type != "inverter"
+                ):
                     aggregate.total_solar_power += solar_power
 
             aggregate.gateways[gateway_id] = status
@@ -2672,6 +2574,79 @@ class GatewayManager:
                 aggregate.grid_status = primary.data.grid_status
 
         return aggregate
+
+
+    def _warn_transport_ignored(
+        self,
+        config: GatewayConfig,
+        basic_lan: bool,
+        auth_mode: str,
+        api_version: str,
+    ) -> None:
+        """Log where pypowerwall will not honour the requested transport.
+
+        pypowerwall.Powerwall() forwards ``tedapi_auth_mode`` only when it
+        builds the full TEDAPI client (host + gw_pwd, no customer password)
+        and ``tedapi_api_version`` in that mode plus TEDAPI v1r. Basic LAN,
+        hybrid (gw_pwd + password) and cloud/FleetAPI gateways never see
+        either value, and v1r rejects bearer outright - so say so at
+        registration instead of leaving the operator to wonder why /stats
+        still reports "basic".
+        """
+        from app.config import settings
+
+        wants_bearer = auth_mode == str(AuthMode.BEARER)
+        wants_v2026 = api_version != str(TEDAPIApiVersion.V2024_06)
+
+        too_old_pb = wants_v2026 and (
+            _protobuf_version() is not None
+            and _protobuf_version() < V2026_PROTOBUF_MIN
+        )
+        if too_old_pb:
+            logger.warning(
+                "Gateway %s: tedapi_api_version=%s needs protobuf >= %s "
+                "(installed: %s) — run: pip install 'protobuf>=6.33.6'",
+                config.id,
+                api_version,
+                ".".join(str(x) for x in V2026_PROTOBUF_MIN),
+                ".".join(str(x) for x in (_protobuf_version() or ())),
+            )
+
+        if not (wants_bearer or wants_v2026):
+            return
+
+        effective_password = config.password
+        if not effective_password and not config.gw_pwd:
+            effective_password = settings.pw_password
+
+        hybrid = bool(
+            config.host and config.gw_pwd and effective_password
+        )
+        if config.cloud_mode or config.fleetapi or not config.host:
+            reason = "cloud/FleetAPI gateways do not use TEDAPI"
+        elif basic_lan:
+            reason = "Basic LAN mode uses pypowerwall's local client"
+        elif hybrid:
+            reason = (
+                "hybrid mode (gw_pwd + password) uses pypowerwall's local client"
+            )
+        elif config.rsa_key_path and wants_bearer:
+            reason = "TEDAPI v1r (rsa_key_path) is incompatible with bearer auth"
+        else:
+            reason = None
+
+        if reason:
+            ignored = []
+            if wants_bearer:
+                ignored.append(f"tedapi_auth_mode={auth_mode}")
+            if wants_v2026 and not (config.rsa_key_path and wants_bearer):
+                ignored.append(f"tedapi_api_version={api_version}")
+            logger.warning(
+                "Gateway %s: %s is ignored - %s",
+                config.id,
+                " and ".join(ignored),
+                reason,
+            )
 
 
 # Global gateway manager instance

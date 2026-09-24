@@ -2326,22 +2326,10 @@
             lastUpdateTime = new Date();
             document.getElementById('last-update-time').textContent = lastUpdateTime.toLocaleTimeString();
             
-            // Solar (Powerwall solar generation, excluding standalone inverter solar)
-            let solarPowerWatts = 0;
-            if (data.gateways && Object.keys(data.gateways).length > 0) {
-                for (const [gwId, gwStatus] of Object.entries(data.gateways)) {
-                    const type = gwStatus.gateway?.type || gatewayMeta[gwId]?.type || 'powerwall';
-                    if (type !== 'inverter') {
-                        const gwSolar = gwStatus.data?.aggregates?.solar?.instant_power || 0;
-                        solarPowerWatts += gwSolar;
-                    }
-                }
-            } else {
-                solarPowerWatts = data.total_solar_power || 0;
-            }
-            const solarKw = formatPower(solarPowerWatts);
+            // Solar
+            const solarKw = formatPower(data.total_solar_power || 0);
             document.getElementById('solar-power').textContent = `${solarKw} kW`;
-            addTrendPoint('solar', solarPowerWatts / 1000);
+            addTrendPoint('solar', (data.total_solar_power || 0) / 1000);
             drawTrendChart('solar-trend', trendData.solar, '#f0c000');
             
             // Battery

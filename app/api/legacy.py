@@ -766,49 +766,59 @@ async def get_alerts_pw():
 
 
 @router.get("/fans")
-async def get_fans(gateway: Optional[str] = Query(default=None)):
+async def get_fans(gateway: Optional[str] = Query(None)):
     """Get fan speeds in raw format (legacy proxy endpoint).
+
+    Supports optional ?gateway=ID parameter to query a specific gateway.
+    If default gateway has no fan speeds, automatically falls back to any configured
+    gateway that has reported fan speed data.
 
     Uses graceful degradation: returns cached data even if gateway is temporarily offline.
     """
-    target_id = gateway or get_default_gateway()
-    status = gateway_manager.get_gateway(target_id)
+    if gateway:
+        status = gateway_manager.get_gateway(gateway)
+        if not status or not status.data:
+            return {}
+        return status.data.fan_speeds or {}
+
+    gateway_id = get_default_gateway()
+    status = gateway_manager.get_gateway(gateway_id)
 
     if status and status.data and status.data.fan_speeds:
         return status.data.fan_speeds
 
-    # If gateway was not explicitly specified and target has no fan_speeds,
-    # search all configured gateways (e.g. standalone inverter gateway)
-    if not gateway and gateway_manager.gateways:
-        for gw_id in gateway_manager.gateways:
-            gw_status = gateway_manager.get_gateway(gw_id)
-            if gw_status and gw_status.data and gw_status.data.fan_speeds:
-                return gw_status.data.fan_speeds
+    # Multi-gateway fallback: search all configured gateways (e.g. standalone inverter gateway)
+    for gw_id, gw_status in gateway_manager.cache.items():
+        if gw_status.data and gw_status.data.fan_speeds:
+            return gw_status.data.fan_speeds
 
     return {}
 
 
 @router.get("/fans/pw")
-async def get_fans_pw(gateway: Optional[str] = Query(default=None)):
+async def get_fans_pw(gateway: Optional[str] = Query(None)):
     """Get fan speeds in simplified format (legacy proxy endpoint).
+
+    Supports optional ?gateway=ID parameter to query a specific gateway.
+    If default gateway has no fan speeds, automatically falls back to any configured
+    gateway that has reported fan speed data.
 
     Uses graceful degradation: returns cached data even if gateway is temporarily offline.
     """
-    target_id = gateway or get_default_gateway()
-    status = gateway_manager.get_gateway(target_id)
+    if gateway:
+        status = gateway_manager.get_gateway(gateway)
+        fan_speeds = (status.data.fan_speeds if status and status.data else None) or {}
+    else:
+        gateway_id = get_default_gateway()
+        status = gateway_manager.get_gateway(gateway_id)
+        fan_speeds = (status.data.fan_speeds if status and status.data else None) or {}
 
-    fan_speeds = status.data.fan_speeds if status and status.data else None
+        if not fan_speeds:
+            for gw_id, gw_status in gateway_manager.cache.items():
+                if gw_status.data and gw_status.data.fan_speeds:
+                    fan_speeds = gw_status.data.fan_speeds
+                    break
 
-    # If gateway was not explicitly specified and target has no fan_speeds,
-    # search all configured gateways (e.g. standalone inverter gateway)
-    if not fan_speeds and not gateway and gateway_manager.gateways:
-        for gw_id in gateway_manager.gateways:
-            gw_status = gateway_manager.get_gateway(gw_id)
-            if gw_status and gw_status.data and gw_status.data.fan_speeds:
-                fan_speeds = gw_status.data.fan_speeds
-                break
-
-    fan_speeds = fan_speeds or {}
     fans = {}
     for i, (_, value) in enumerate(sorted(fan_speeds.items())):
         key = f"FAN{i+1}"
@@ -2175,9 +2185,8 @@ async def get_stats():
     pw3 = False
     tedapi_mode = None
     siteid = None
-    # Effective TEDAPI transport of the first TEDAPI gateway (active values
-    # once reported, else requested); falls back to the configured defaults
-    # when no gateway speaks TEDAPI. Mirrors the proxy's /stats fields.
+    # Active TEDAPI transport of the first gateway that has reported one,
+    # else the configured defaults. Mirrors the proxy's /stats fields.
     tedapi_auth_mode = None
     tedapi_api_version = None
 
@@ -2214,10 +2223,12 @@ async def get_stats():
         now = datetime.now().timestamp()
         backoff_remaining = max(0, int(next_poll - now))
 
-        transport = gateway_manager.tedapi_transport(gateway_id)
-        if tedapi_auth_mode is None and transport["auth_mode"]:
-            tedapi_auth_mode = transport["auth_mode"]
-            tedapi_api_version = transport["api_version"]
+        gw_data = status.data if status else None
+        active_auth_mode = gw_data.tedapi_auth_mode if gw_data else None
+        active_api_version = gw_data.tedapi_api_version if gw_data else None
+        if tedapi_auth_mode is None and active_auth_mode:
+            tedapi_auth_mode = active_auth_mode
+            tedapi_api_version = active_api_version
 
         gateway_statuses.append(
             {
@@ -2231,12 +2242,12 @@ async def get_stats():
                 else None,
                 "consecutive_failures": failures,
                 "backoff_seconds": backoff_remaining if failures > 0 else 0,
-                # Requested vs active TEDAPI transport (None for non-TEDAPI
-                # gateways; *_active is None until the first successful poll).
-                "tedapi_auth_mode": transport["requested_auth_mode"],
-                "tedapi_auth_mode_active": transport["active_auth_mode"],
-                "tedapi_api_version": transport["requested_api_version"],
-                "tedapi_api_version_active": transport["active_api_version"],
+                # Requested vs active TEDAPI transport (*_active is None until
+                # the live client reports it).
+                "tedapi_auth_mode": gw.tedapi_auth_mode,
+                "tedapi_auth_mode_active": active_auth_mode,
+                "tedapi_api_version": gw.tedapi_api_version,
+                "tedapi_api_version_active": active_api_version,
             }
         )
 

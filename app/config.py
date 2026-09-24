@@ -193,7 +193,7 @@ import json
 import logging
 import os
 from typing import List, Optional
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -243,6 +243,20 @@ class GatewayConfig(BaseModel):
     # here, so a bad value in one entry cannot abort config loading.
     tedapi_auth_mode: Optional[str] = None  # "basic" | "bearer"
     tedapi_api_version: Optional[str] = None  # "V2024_06" | "V2026_06"
+
+    @field_validator("tedapi_auth_mode", mode="before")
+    @classmethod
+    def _normalise_auth_mode(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+    @field_validator("tedapi_api_version", mode="before")
+    @classmethod
+    def _normalise_api_version(cls, v):
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
 
     @model_validator(mode="after")
     def _default_name_to_id(self):
@@ -346,6 +360,20 @@ class Settings(BaseSettings):
     tedapi_api_version: str = Field(
         default="V2024_06", alias="PW_TEDAPI_API_VERSION"
     )
+
+    @field_validator("tedapi_auth_mode", mode="before")
+    @classmethod
+    def _normalise_settings_auth_mode(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+    @field_validator("tedapi_api_version", mode="before")
+    @classmethod
+    def _normalise_settings_api_version(cls, v):
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
 
     # CORS configuration
     cors_origins: List[str] = Field(default=["*"], alias="CORS_ORIGINS")

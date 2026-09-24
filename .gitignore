@@ -5,7 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+.auth/
+pws-data/
 # Distribution / packaging
 .Python
 build/
@@ -211,13 +212,14 @@ __marimo__/
 .beta_version
 .DS_Store
 sandbox/
+pws-data/
 sync.sh
 pypowerwall
 pwsimulator
 issues/
 r
 tedapi_rsa_private.pem
-
+docker-compose.yml
 # Local gateway config (may contain credentials)
 gateways.yaml
 

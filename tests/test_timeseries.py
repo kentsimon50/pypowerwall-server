@@ -506,6 +506,50 @@ class TestTrend:
         assert fit_b["end"] == pytest.approx(now - 60)
         await store.stop()
 
+    @pytest.mark.asyncio
+    async def test_trend_excludes_inverter_solar(self, tmp_path, mock_gateway_manager):
+        """Aggregate trend excludes solar from inverter-type gateways when Powerwalls are present."""
+        from app.models.gateway import Gateway
+        store = TimeSeriesStore(db_path=str(tmp_path / "ts.db"))
+        now = time.time()
+        mock_gateway_manager.gateways["pw"] = Gateway(
+            id="pw", name="Powerwall", host="10.0.0.1", gw_pwd="pw", type="powerwall"
+        )
+        mock_gateway_manager.gateways["inv"] = Gateway(
+            id="inv", name="Inverter", host="10.0.0.2", gw_pwd="pw", type="inverter"
+        )
+
+        await record(store, now - 300, solar=5000, gw="pw")
+        await record(store, now - 300, solar=3000, gw="inv")
+
+        trend = await store.get_trend(start=now - 600, end=now)
+        assert trend["count"] == 1
+        assert trend["points"][0]["solar_kw"] == pytest.approx(5.0)
+
+        inv_trend = await store.get_trend(start=now - 600, end=now, gateway="inv")
+        assert inv_trend["count"] == 1
+        assert inv_trend["points"][0]["solar_kw"] == pytest.approx(3.0)
+        await store.stop()
+
+    @pytest.mark.asyncio
+    async def test_trend_includes_inverter_solar_when_no_powerwalls(self, tmp_path, mock_gateway_manager):
+        """Aggregate trend includes solar from inverter-type gateways when no Powerwalls exist."""
+        from app.models.gateway import Gateway
+        store = TimeSeriesStore(db_path=str(tmp_path / "ts.db"))
+        now = time.time()
+        mock_gateway_manager.gateways.clear()
+        mock_gateway_manager.gateways["inv"] = Gateway(
+            id="inv", name="Inverter", host="10.0.0.2", gw_pwd="pw", type="inverter"
+        )
+
+        await record(store, now - 300, solar=3000, gw="inv")
+
+        trend = await store.get_trend(start=now - 600, end=now)
+        assert trend["count"] == 1
+        assert trend["points"][0]["solar_kw"] == pytest.approx(3.0)
+        await store.stop()
+
+
 
 # ---------------------------------------------------------------------------
 # API endpoints (uses the app TestClient; conftest isolates the DB path)

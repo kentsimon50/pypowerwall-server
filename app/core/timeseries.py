@@ -731,27 +731,42 @@ class TimeSeriesStore:
             # Inner query: mean per (bucket, gateway) so multi-gateway setups
             # sum instead of average; outer query collapses to fleet totals
             # (mean SoE). Single-gateway deployments get plain bucket means.
-            # Inverter-only gateways (type: "inverter") are excluded from solar_kw sum.
+            # Standalone solar-inverter gateways (type: "inverter") are excluded
+            # from fleet solar sums if Powerwall gateways are present, to avoid
+            # double-counting solar already measured by Powerwalls. If only inverters
+            # exist (no Powerwalls), inverters are included.
             from app.core.gateway_manager import gateway_manager
 
-            inverter_ids = [
-                gw_id
-                for gw_id, gw in gateway_manager.gateways.items()
-                if getattr(gw, "type", "powerwall") == "inverter"
+            inverter_gw_ids = [
+                gid
+                for gid, gw in gateway_manager.gateways.items()
+                if gw and gw.type == "inverter"
             ]
-            if inverter_ids and not gateway:
-                inverter_placeholders = ",".join("?" for _ in inverter_ids)
-                solar_select = f"SUM(CASE WHEN gateway_id IN ({inverter_placeholders}) THEN 0 ELSE solar_avg END)/1000.0 AS solar_kw, "
-                extra_params = tuple(inverter_ids)
-            else:
-                solar_select = "SUM(solar_avg)/1000.0 AS solar_kw, "
-                extra_params = ()
+            if not inverter_gw_ids:
+                inverter_gw_ids = [
+                    gid
+                    for gid, status in gateway_manager.cache.items()
+                    if status.gateway and status.gateway.type == "inverter"
+                ]
+
+            has_powerwalls = any(
+                gw and gw.type != "inverter"
+                for gw in gateway_manager.gateways.values()
+            ) or any(
+                status.gateway and status.gateway.type != "inverter"
+                for status in gateway_manager.cache.values()
+            )
 
             gw_filter = "AND gateway_id=? " if gateway else ""
+            inverter_filter = ""
+            if not gateway and inverter_gw_ids and has_powerwalls:
+                placeholders = ",".join("?" for _ in inverter_gw_ids)
+                inverter_filter = f"AND gateway_id NOT IN ({placeholders}) "
+
             sql = (
                 "SELECT bstart, "
-                + solar_select
-                + "SUM(home_avg)/1000.0 AS home_kw, "
+                "SUM(solar_avg)/1000.0 AS solar_kw, "
+                "SUM(home_avg)/1000.0 AS home_kw, "
                 "SUM(batt_avg)/1000.0 AS battery_kw, "
                 "SUM(grid_avg)/1000.0 AS grid_kw, "
                 "AVG(soe_avg) AS battery_level "
@@ -762,20 +777,17 @@ class TimeSeriesStore:
                 "AVG(grid_import_w - grid_export_w) AS grid_avg, "
                 "AVG(soe) AS soe_avg FROM samples WHERE ts>=? AND ts<=? "
                 + gw_filter
+                + inverter_filter
                 + "GROUP BY bstart, gateway_id) "
                 "GROUP BY bstart ORDER BY bstart"
             )
-            rows = conn.execute(
-                sql,
-                (
-                    *extra_params,
-                    bucket,
-                    bucket,
-                    start,
-                    end,
-                    *((gateway,) if gateway else ()),
-                ),
-            ).fetchall()
+            params = [bucket, bucket, start, end]
+            if gateway:
+                params.append(gateway)
+            elif inverter_gw_ids and has_powerwalls:
+                params.extend(inverter_gw_ids)
+
+            rows = conn.execute(sql, tuple(params)).fetchall()
             points = [
                 {
                     "ts": row["bstart"],
