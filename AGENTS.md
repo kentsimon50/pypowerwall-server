@@ -85,6 +85,12 @@ manager = GatewayManager()
 
 All API endpoints read from the in-memory cache populated by background polling. **Never make blocking pypowerwall calls during HTTP requests**:
 
+> **Exceptions**: control writes (`POST /control/*`) and the Tesla tariff routes
+> (`/api/tesla/tariff_rate`, `/api/tesla/time_of_use_settings`) call the Tesla
+> cloud on demand, always through the executor with a timeout. The tariff GET is
+> unauthenticated, so it keeps its own 5-minute server-side cache
+> (`app/api/legacy.py`) and runs one refresh at a time.
+
 ```python
 # ✅ Correct - read from cache
 @router.get("/aggregates")
@@ -185,6 +191,21 @@ async def get_aggregates():
     if not settings.neg_solar and solar < 0:
         ...
 ```
+
+### 8. History and Time-Series Extensions
+
+Follow DESIGN.md "History and Time-Series Data" when adding recorded signals or
+history UI:
+
+- Add a signal by extending the code registry and metric catalog. Don't add an
+  environment variable per signal; environment variables only control interval,
+  retention and on/off.
+- The history page must render new metrics and new chart groups from the
+  catalog, with no page edits. Viewing choices live in the URL and browser
+  storage.
+- Record from data the poll already has (no extra gateway calls), keep database
+  work off the event loop, and never let recording break a poll.
+- Put shared chart code in a shared static script, not a copy per page.
 
 ## Configuration
 

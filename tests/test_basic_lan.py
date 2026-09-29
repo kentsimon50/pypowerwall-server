@@ -732,3 +732,47 @@ async def test_api_operation_null_when_cloud_never_seen(
         assert data["real_mode"] is None
         assert data["backup_reserve_percent"] is None
         assert data["stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_basic_lan_degraded_cloud_control_skips_stub_grid_getters(
+    mock_gateway_manager, mock_pypowerwall
+):
+    """Basic LAN + degraded cloud-control client must not poll grid getters.
+
+    The hybrid cloud-control connection (auto_select=True) can fall back to
+    a local client when FleetAPI and cloud auth both fail. On that client
+    get_grid_charging()/get_grid_export() are ERROR-logging stubs (issue
+    #114), so the Basic LAN poll path must gate its supplementary reads on
+    _grid_controls_supported() instead of calling them.
+
+    The mock uses explicit cloudmode/fleetapi/tedapi_mode attributes — an
+    unconstrained Mock would make the dynamically created cloudmode
+    attribute truthy and mask exactly this regression.
+    """
+    mock_pypowerwall.tedapi = None
+
+    cloud = Mock(
+        spec=["get_mode", "get_reserve", "get_grid_charging", "get_grid_export",
+              "cloudmode", "fleetapi", "tedapi_mode"]
+    )
+    cloud.cloudmode = False
+    cloud.fleetapi = False
+    cloud.tedapi_mode = None  # degraded to local: unsupported stubs
+    cloud.get_mode.return_value = "autonomous"
+    cloud.get_reserve.return_value = 12.0
+    gateway_manager._cloud_control = cloud
+    gateway_manager._cloud_control_configured = True
+
+    gw = Gateway(id="pw3-degraded-cloud", name="PW3", host="10.42.1.47", basic_lan=True)
+    gateway_manager.gateways["pw3-degraded-cloud"] = gw
+    gateway_manager.connections["pw3-degraded-cloud"] = mock_pypowerwall
+
+    data = await gateway_manager._fetch_gateway_data(
+        "pw3-degraded-cloud", mock_pypowerwall
+    )
+
+    cloud.get_grid_charging.assert_not_called()
+    cloud.get_grid_export.assert_not_called()
+    assert data.grid_charging is None
+    assert data.grid_export is None

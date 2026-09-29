@@ -1181,6 +1181,10 @@
         /* Powerwall Health Card */
         .powerwall-card {
             grid-column: span 12;
+            /* Each card's backdrop-filter makes a stacking context; lift this one
+               so a temperature card near the bottom isn't painted under the next */
+            position: relative;
+            z-index: 2;
         }
         
         .powerwall-table {
@@ -1217,6 +1221,63 @@
         .powerwall-name {
             font-weight: 600;
             color: var(--text-primary);
+        }
+
+        /* Temp / Fans cells: headline value, full breakdown on hover, keyboard
+           focus, or tap (tabindex makes the cell focusable on touch screens) */
+        .pw-detail {
+            position: relative;
+            white-space: nowrap;
+            cursor: help;
+            border-bottom: 1px dotted var(--text-muted);
+        }
+
+        .pw-detail:focus {
+            outline: none;
+        }
+
+        .pw-detail:focus-visible {
+            outline: 1px solid var(--accent-blue);
+            outline-offset: 3px;
+            border-radius: 2px;
+        }
+
+        .pw-detail-card {
+            display: none;
+            position: absolute;
+            right: 0;
+            top: calc(100% + 6px);
+            z-index: 10;
+            min-width: 210px;
+            padding: 8px 12px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+            font-size: 0.9em;
+            color: var(--text-primary);
+            cursor: default;
+        }
+
+        .pw-detail:hover .pw-detail-card,
+        .pw-detail:focus .pw-detail-card {
+            display: block;
+        }
+
+        .pw-detail-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 2px 0;
+        }
+
+        .pw-detail-label {
+            color: var(--text-secondary);
+        }
+
+        .pw-detail-warn {
+            margin-top: 6px;
+            color: var(--accent-yellow);
         }
 
         .powerwall-expansion-row td {
@@ -1645,6 +1706,131 @@
             margin-top: 0;
             padding-top: 0;
         }
+        /* ---- Card visibility + kiosk mode ----------------------------------
+           Hidden cards use a class with !important so they stay hidden even
+           when feature checks later reset card.style.display = ''. */
+        .card.user-hidden {
+            display: none !important;
+        }
+        /* The two extra header links would push the header wider than the
+           page on narrow screens; let it wrap instead */
+        header {
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .header-links {
+            flex-wrap: wrap;
+        }
+        /* When cards are hidden, the remaining cards in a row share its width
+           (--card-span is set by applyCardLayout()). Desktop only: at 900px
+           and below every card already spans the full width. */
+        @media (min-width: 901px) {
+            .dashboard-grid.cards-customized .card[data-card-span] {
+                grid-column: span var(--card-span);
+            }
+        }
+        .card-menu {
+            position: fixed;
+            top: 72px;
+            right: 20px;
+            z-index: 1000;
+            min-width: 240px;
+            max-height: calc(100vh - 100px);
+            overflow-y: auto;
+            padding: 14px 16px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            color: var(--text-primary);
+            font-size: 0.9em;
+        }
+        .card-menu[hidden] {
+            display: none;
+        }
+        .card-menu h4 {
+            margin: 0 0 8px;
+            font-size: 0.8em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+        .card-menu label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 0;
+            cursor: pointer;
+        }
+        .card-menu .card-menu-note {
+            color: var(--text-secondary);
+            font-size: 0.8em;
+            margin-left: auto;
+        }
+        .card-menu hr {
+            border: none;
+            border-top: 1px solid var(--border-color);
+            margin: 10px 0;
+        }
+        .card-menu button {
+            width: 100%;
+            padding: 6px;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            background: transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+        .card-menu button:hover {
+            color: var(--text-primary);
+        }
+        /* Kiosk: no header or status banner, tighter margins, no hover glow */
+        /* The status banner stays visible while disconnected, so a wall
+           display never shows frozen data without a warning */
+        body.kiosk header,
+        body.kiosk #status-banner.connected {
+            display: none;
+        }
+        body.kiosk .container {
+            max-width: none;
+            padding: 12px;
+        }
+        body.kiosk .card:hover {
+            border-color: var(--border-color);
+            box-shadow: none;
+        }
+        body.kiosk .card-menu {
+            top: 52px;
+        }
+        /* Floating controls, only in kiosk. Faint until hovered or tapped. */
+        .kiosk-controls {
+            display: none;
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            z-index: 999;
+            gap: 6px;
+            opacity: 0.15;
+            transition: opacity 0.3s ease;
+        }
+        body.kiosk .kiosk-controls {
+            display: flex;
+        }
+        .kiosk-controls:hover,
+        .kiosk-controls:focus-within,
+        .kiosk-controls.active {
+            opacity: 1;
+        }
+        .kiosk-controls button {
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 0.85em;
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
@@ -1660,8 +1846,24 @@
                 <a href="{PROXY_BASE}/docs">API Docs</a>
                 <a href="{PROXY_BASE}/api/gateways">Gateways API</a>
                 <a href="https://github.com/jasonacox/pypowerwall-server" target="_blank">GitHub</a>
+                <a href="#" id="card-menu-toggle" role="button" aria-controls="card-menu" aria-expanded="false" title="Show or hide cards">Cards</a>
+                <a href="#" id="kiosk-toggle" role="button" title="Kiosk mode (Esc to exit)">Kiosk</a>
             </div>
         </header>
+
+        <div class="kiosk-controls" id="kiosk-controls">
+            <button type="button" id="kiosk-cards-btn" aria-controls="card-menu" aria-expanded="false">Cards</button>
+            <button type="button" id="kiosk-exit-btn">Exit kiosk</button>
+        </div>
+
+        <div class="card-menu" id="card-menu" role="group" aria-label="Card visibility" hidden>
+            <h4>Show cards</h4>
+            <div id="card-menu-list"></div>
+            <hr>
+            <label><input type="checkbox" id="kiosk-checkbox"> Kiosk mode</label>
+            <hr>
+            <button type="button" id="card-menu-reset">Show all cards</button>
+        </div>
         
         <div id="status-banner" class="status-banner connected">
             <div class="status-dot"></div>
@@ -3009,8 +3211,10 @@
                 const response = await fetch('/stats');
                 if (!response.ok) throw new Error('Failed to load stats');
                 const stats = await response.json();
-                controlIslandingAvailable = stats.pw3 === true
-                    && stats.tedapi === true && stats.tedapi_mode === 'v1r';
+                // Islanding needs the signed v1r command, which the library
+                // supports on Powerwall 2 and 3 alike: gate on the transport
+                controlIslandingAvailable = stats.tedapi === true
+                    && stats.tedapi_mode === 'v1r';
                 updateIslandingControls();
                 
                 // Site Name
@@ -3037,8 +3241,12 @@
                     mode = 'Local';
                 }
 
-                // Append PW3 qualifier if applicable
-                if (stats.pw3) {
+                // Append hardware qualifier for v1r - pw3 is now hardware-based,
+                // leave generic "TEDAPI v1r" while hardware still unknown
+                if (stats.tedapi_mode === 'v1r') {
+                    if (stats.pw3 === true) mode += ' (PW3)';
+                    else if (stats.pw3 === false) mode += ' (PW2)';
+                } else if (stats.pw3) {
                     mode += ' (PW3)';
                 }
                 
@@ -3192,6 +3400,14 @@
             return parts[parts.length - 1];
         }
 
+        // Serial of a vitals block, matched the way /pod matches TEPOD blocks:
+        // the block's serialNumber field when present, else the key's last part
+        // (live PW3 TEDAPI vitals have no serialNumber, only the key carries it)
+        function vitalsBlockSerial(key, block) {
+            const serial = block && block.serialNumber;
+            return typeof serial === 'string' && serial ? serial : deviceSerial(key);
+        }
+
         // Return rows in the physical hierarchy: each expansion follows its
         // Powerwall 3 leader, even when system_status lists it later.
         function arrangePowerwallRows(items, tedapiConfig) {
@@ -3246,7 +3462,144 @@
             return rows;
         }
 
-        function powerwallRowHtml(pw, displayName, isExpansion, isPw3System) {
+        // Temperatures (degrees C) from pypowerwall vitals, keyed by battery serial
+        // (the last "--" part of the device key, as /pod matches TEPOD blocks).
+        // Powerwall 3: pack max/min and shunt on each battery's TEPOD block, plus
+        // the enclosure ambient on each unit's TEPINV block (expansion packs have
+        // no inverter). Powerwall 2: the thermal controller ambient (TETHC).
+        // PCH_heatsinkTemp is not shown: it reads a constant on current firmware.
+        function powerwallTempsBySerial(vitals) {
+            const bySerial = {};
+            const entry = serial => (bySerial[serial] = bySerial[serial] || {});
+            for (const [key, block] of Object.entries(vitals || {})) {
+                if (!block || typeof block !== 'object') continue;
+                const serial = vitalsBlockSerial(key, block);
+                if (!serial) continue;
+                if (key.startsWith('TEPOD--')) {
+                    Object.assign(entry(serial), {
+                        packMax: block.HVP_PackTempMax,
+                        packMin: block.HVP_PackTempMin,
+                        shunt: block.HVP_ShuntTemperature,
+                        overTempEvents: (block.BMS_LOG_tempOutOfBounds || 0) +
+                            (block.BMS_LOG_tempOutOfBoundsCharge || 0),
+                    });
+                } else if (key.startsWith('TEPINV--')) {
+                    entry(serial).ambient = block.PCH_AmbientTemp;
+                } else if (key.startsWith('TETHC--')) {
+                    entry(serial).controller = block.THC_AmbientTemp;
+                }
+            }
+            return bySerial;
+        }
+
+        function isReading(value) {
+            return typeof value === 'number' && Number.isFinite(value);
+        }
+
+        // Headline temperature for a row: hottest pack reading (PW3), else the
+        // thermal controller ambient (PW2) - the same value temps() reports
+        function headlineTemp(temps) {
+            if (!temps) return null;
+            if (isReading(temps.packMax)) return temps.packMax;
+            return isReading(temps.controller) ? temps.controller : null;
+        }
+
+        function powerwallTempCellHtml(temps) {
+            const headline = headlineTemp(temps);
+            if (headline === null) return '<td>--</td>';
+            const rows = [
+                ['Pack max', temps.packMax],
+                ['Pack min', temps.packMin],
+                ['Shunt', temps.shunt],
+                ['Inverter ambient', temps.ambient],
+                ['Controller ambient', temps.controller],
+            ].filter(([, value]) => isReading(value));
+            let summary = rows.map(([label, value]) => `${label} ${value.toFixed(1)} °C`).join(', ');
+            let card = rows.map(([label, value]) =>
+                `<div class="pw-detail-row"><span class="pw-detail-label">${label}</span>` +
+                `<span>${value.toFixed(1)} °C</span></div>`).join('');
+            if (temps.overTempEvents > 0) {
+                const warning = `${temps.overTempEvents} over-temperature ` +
+                    `event${temps.overTempEvents === 1 ? '' : 's'}`;
+                card += `<div class="pw-detail-warn">⚠ ${warning}</div>`;
+                summary += `. Warning: ${warning}`;
+            }
+            return `<td><span class="pw-detail" tabindex="0" aria-label="${summary}">` +
+                `${headline.toFixed(1)} °C<span class="pw-detail-card" aria-hidden="true">${card}</span></span></td>`;
+        }
+
+        // True when any row has a temperature - otherwise the column is hidden
+        // (cloud / basic-LAN modes, or firmware without the signals)
+        function anyPowerwallTemps(rows, tempsBySerial) {
+            return rows.some(({ item }) =>
+                headlineTemp(tempsBySerial[deviceSerial(item.PackageSerialNumber)]) !== null);
+        }
+
+        // Fans from pypowerwall vitals, keyed by battery serial like temperatures.
+        // Powerwall 3: two inverter fans (A, B) on each unit's TEPINV block, measured
+        // RPM plus drive duty cycle (%); there is no target RPM. Expansion packs have
+        // no inverter, so no fans. Powerwall 2: one fan on the PVAC block, actual and
+        // target RPM (same signals as /fans/pw). TEPINV wins over a PVAC block with
+        // the same serial, whatever the key order.
+        function powerwallFansBySerial(vitals) {
+            const bySerial = {};
+            for (const [key, block] of Object.entries(vitals || {})) {
+                if (!block || typeof block !== 'object') continue;
+                const serial = vitalsBlockSerial(key, block);
+                if (!serial) continue;
+                if (key.startsWith('TEPINV--')) {
+                    bySerial[serial] = {
+                        fans: ['A', 'B'].map(fan => ({
+                            label: `Fan ${fan}`,
+                            rpm: block[`PCH_FanSpeed_${fan}`],
+                            duty: block[`PCH_FanDuty_${fan}`],
+                        })),
+                    };
+                } else if (key.startsWith('PVAC--') && !bySerial[serial] &&
+                    (isReading(block.PVAC_Fan_Speed_Actual_RPM) ||
+                        isReading(block.PVAC_Fan_Speed_Target_RPM))) {
+                    // PW3 vitals also carry a PVAC block (same serial, no fan
+                    // readings): it must never replace that unit's TEPINV fans
+                    bySerial[serial] = {
+                        fans: [{ label: 'Fan', rpm: block.PVAC_Fan_Speed_Actual_RPM }],
+                        target: block.PVAC_Fan_Speed_Target_RPM,
+                    };
+                }
+            }
+            return bySerial;
+        }
+
+        // Headline for a row: the fastest fan's measured RPM (0 is a real reading)
+        function headlineFanRpm(fans) {
+            const rpms = (fans?.fans || []).map(fan => fan.rpm).filter(isReading);
+            return rpms.length ? Math.max(...rpms) : null;
+        }
+
+        function powerwallFanCellHtml(fans) {
+            const headline = headlineFanRpm(fans);
+            if (headline === null) return '<td>--</td>';
+            const rpmText = value => (isReading(value) ? `${Math.round(value)} rpm` : '--');
+            const rows = fans.fans
+                .filter(fan => isReading(fan.rpm) || isReading(fan.duty))
+                .map(fan => [fan.label, rpmText(fan.rpm) +
+                    (isReading(fan.duty) ? ` · ${fan.duty.toFixed(1)}%` : '')]);
+            if (isReading(fans.target)) rows.push(['Target', rpmText(fans.target)]);
+            const summary = rows.map(([label, value]) => `${label} ${value}`).join(', ');
+            const card = rows.map(([label, value]) =>
+                `<div class="pw-detail-row"><span class="pw-detail-label">${label}</span>` +
+                `<span>${value}</span></div>`).join('');
+            return `<td><span class="pw-detail" tabindex="0" aria-label="${summary}">` +
+                `${rpmText(headline)}<span class="pw-detail-card" aria-hidden="true">${card}</span></span></td>`;
+        }
+
+        // True when any row has a fan reading - otherwise the column is hidden
+        // (cloud / basic-LAN modes, or a library/firmware without the signals)
+        function anyPowerwallFans(rows, fansBySerial) {
+            return rows.some(({ item }) =>
+                headlineFanRpm(fansBySerial[deviceSerial(item.PackageSerialNumber)]) !== null);
+        }
+
+        function powerwallRowHtml(pw, displayName, isExpansion, isPw3System, tempsBySerial = null, fansBySerial = null) {
             const capacity = pw.POD_nom_full_pack_energy || pw.nominal_full_pack_energy;
             const capacityKwh = capacity ? (capacity / 1000).toFixed(2) : '--';
             const capacityNum = capacity ? capacity / 1000 : 0;
@@ -3272,7 +3625,10 @@
                 `<td>${capacityKwh} kWh <span class="${capacityClass}">(${capacityPct}%)</span></td>` +
                 `<td>${voltage} V</td>` +
                 `<td>${power} kW<span class="energy-arrow ${powerArrowClass}">${powerArrow}</span></td>` +
-                `<td>${frequency} Hz</td></tr>`;
+                `<td>${frequency} Hz</td>` +
+                (tempsBySerial ? powerwallTempCellHtml(tempsBySerial[deviceSerial(pw.PackageSerialNumber)]) : '') +
+                (fansBySerial ? powerwallFanCellHtml(fansBySerial[deviceSerial(pw.PackageSerialNumber)]) : '') +
+                '</tr>';
         }
 
         async function loadPowerwalls() {
@@ -3281,6 +3637,10 @@
             if (!isMulti) {
             // Single gateway — full detail view via /pod (unchanged)
             try {
+                // Vitals (temperatures) are optional: a failed fetch only hides the column
+                const vitalsPromise = fetch('/vitals')
+                    .then(r => (r.ok ? r.json() : {}))
+                    .catch(() => ({}));
                 const response = await fetch('/pod');
                 if (!response.ok) throw new Error('Failed to load pod data');
                 const pod = await response.json();
@@ -3310,6 +3670,12 @@
                     return;
                 }
                 
+                const vitals = await vitalsPromise;
+                const tempsBySerial = powerwallTempsBySerial(vitals);
+                const showTemps = anyPowerwallTemps(pwRows, tempsBySerial);
+                const fansBySerial = powerwallFansBySerial(vitals);
+                const showFans = anyPowerwallFans(pwRows, fansBySerial);
+
                 // Build table
                 let html = '<table class="powerwall-table"><thead><tr>';
                 html += '<th>Powerwall</th>';
@@ -3318,16 +3684,20 @@
                 html += '<th>Voltage</th>';
                 html += '<th>Power</th>';
                 html += '<th>Frequency</th>';
+                if (showTemps) html += '<th>Temp</th>';
+                if (showFans) html += '<th>Fans</th>';
                 html += '</tr></thead><tbody>';
-                
+
                 const SPEC_CAPACITY = 13.5; // kWh per Powerwall
-                
+
                 pwRows.forEach(({ item: pw, isExpansion }) => {
                     html += powerwallRowHtml(
                         pw,
                         pw.name,
                         isExpansion,
-                        gatewayMeta['default']?.pw3 || window._systemPw3 || false
+                        gatewayMeta['default']?.pw3 || window._systemPw3 || false,
+                        showTemps ? tempsBySerial : null,
+                        showFans ? fansBySerial : null
                     );
                 });
                 
@@ -3521,17 +3891,24 @@
                     html += `<div class="gateway-section-header">${gwName}</div>`;
                     if (!blocks.length) { html += '<div class="no-strings">No Powerwall data</div>'; continue; }
                     // Battery table (same columns as single-gateway view)
-                    html += '<table class="powerwall-table"><thead><tr><th>Powerwall</th><th>Model</th><th>Capacity</th><th>Voltage</th><th>Power</th><th>Frequency</th></tr></thead><tbody>';
                     const rows = arrangePowerwallRows(
                         blocks.map((block, i) => ({ ...block, name: `PW${i + 1}` })),
                         status.data.tedapi_config
                     );
+                    const tempsBySerial = powerwallTempsBySerial(status.data.vitals);
+                    const showTemps = anyPowerwallTemps(rows, tempsBySerial);
+                    const fansBySerial = powerwallFansBySerial(status.data.vitals);
+                    const showFans = anyPowerwallFans(rows, fansBySerial);
+                    html += '<table class="powerwall-table"><thead><tr><th>Powerwall</th><th>Model</th><th>Capacity</th><th>Voltage</th><th>Power</th><th>Frequency</th>' +
+                        (showTemps ? '<th>Temp</th>' : '') + (showFans ? '<th>Fans</th>' : '') + '</tr></thead><tbody>';
                     rows.forEach(({ item: block, isExpansion }) => {
                         html += powerwallRowHtml(
                             block,
                             block.name,
                             isExpansion,
-                            gatewayMeta[gwId]?.pw3 || false
+                            gatewayMeta[gwId]?.pw3 || false,
+                            showTemps ? tempsBySerial : null,
+                            showFans ? fansBySerial : null
                         );
                     });
                     html += '</tbody></table>';
@@ -4666,6 +5043,232 @@
         })();
 
         console.log('PyPowerwall Server console loaded');
+    </script>
+    <script>
+        // ---- Card visibility + kiosk mode ---------------------------------
+        // Choices persist in this browser's localStorage. For a kiosk browser
+        // you can set them in the URL instead (not saved):
+        //   /console?kiosk=1&hide=alerts,gateways,mqtt
+        // Card ids are the card's class name without "-card", e.g. power-flow,
+        // energy, alerts, strings, health, control, powerwall, gateways, mqtt,
+        // daily-energy.
+        (function () {
+            const HIDDEN_KEY = 'pw_console_hidden_cards';
+            const KIOSK_KEY = 'pw_console_kiosk';
+            // Cards that share a row on desktop; remaining ones split its width
+            const ROWS = [['power-flow', 'energy'], ['alerts', 'strings', 'health']];
+
+            const grid = document.querySelector('.dashboard-grid');
+            if (!grid) return;
+            const menu = document.getElementById('card-menu');
+            const list = document.getElementById('card-menu-list');
+            const kioskBox = document.getElementById('kiosk-checkbox');
+            const controls = document.getElementById('kiosk-controls');
+
+            const params = new URLSearchParams(location.search);
+            const urlHide = params.has('hide')
+                ? params.get('hide').split(',').map(s => s.trim()).filter(Boolean)
+                : null;
+            const urlKiosk = params.has('kiosk') ? params.get('kiosk') !== '0' : null;
+
+            function storageGet(key) {
+                try { return localStorage.getItem(key); } catch (e) { return null; }
+            }
+            function storageSet(key, value) {
+                try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
+            }
+
+            function cardId(card) {
+                for (const c of card.classList) {
+                    if (c !== 'card' && c.endsWith('-card')) return c.slice(0, -5);
+                }
+                return null;
+            }
+            const cards = Array.from(grid.children).filter(el => el.classList.contains('card'));
+            const byId = {};
+            cards.forEach(card => {
+                const id = cardId(card);
+                if (id) { card.dataset.cardId = id; byId[id] = card; }
+            });
+
+            let hidden;
+            if (urlHide) {
+                hidden = new Set(urlHide);
+            } else {
+                let saved = [];
+                try { saved = JSON.parse(storageGet(HIDDEN_KEY) || '[]'); } catch (e) { /* ignore */ }
+                hidden = new Set(Array.isArray(saved)
+                    ? saved.filter(id => typeof id === 'string') : []);
+            }
+            let kiosk = urlKiosk !== null ? urlKiosk : storageGet(KIOSK_KEY) === '1';
+
+            function saveHidden() {
+                if (!urlHide) storageSet(HIDDEN_KEY, JSON.stringify([...hidden]));
+            }
+
+            // Cards shown or hidden by feature checks (strings, MQTT, control...)
+            function isShown(card) {
+                return !!card && !card.classList.contains('user-hidden')
+                    && getComputedStyle(card).display !== 'none';
+            }
+
+            function applyCardLayout() {
+                cards.forEach(card => {
+                    card.classList.toggle('user-hidden', hidden.has(card.dataset.cardId));
+                });
+                grid.classList.toggle('cards-customized', hidden.size > 0);
+                ROWS.forEach(row => {
+                    const members = row.map(id => byId[id]).filter(Boolean);
+                    const visible = members.filter(isShown);
+                    members.forEach(card => {
+                        if (hidden.size > 0 && visible.includes(card)) {
+                            const span = String(Math.floor(12 / visible.length));
+                            if (card.dataset.cardSpan !== span) {
+                                card.dataset.cardSpan = span;
+                                card.style.setProperty('--card-span', span);
+                            }
+                        } else if (card.dataset.cardSpan) {
+                            delete card.dataset.cardSpan;
+                            card.style.removeProperty('--card-span');
+                        }
+                    });
+                });
+            }
+
+            function cardLabel(card) {
+                const title = card.querySelector('.card-title');
+                const text = title ? title.textContent.replace(/\s+/g, ' ').trim() : '';
+                return text || card.dataset.cardId;
+            }
+
+            function buildMenu() {
+                list.innerHTML = '';
+                cards.forEach(card => {
+                    const id = card.dataset.cardId;
+                    if (!id) return;
+                    const label = document.createElement('label');
+                    const box = document.createElement('input');
+                    box.type = 'checkbox';
+                    box.checked = !hidden.has(id);
+                    box.addEventListener('change', () => {
+                        if (box.checked) hidden.delete(id); else hidden.add(id);
+                        saveHidden();
+                        applyCardLayout();
+                    });
+                    label.appendChild(box);
+                    label.appendChild(document.createTextNode(cardLabel(card)));
+                    // Feature-gated cards that aren't active on this server
+                    if (!hidden.has(id) && !isShown(card)) {
+                        const note = document.createElement('span');
+                        note.className = 'card-menu-note';
+                        note.textContent = 'not active';
+                        label.appendChild(note);
+                    }
+                    list.appendChild(label);
+                });
+                kioskBox.checked = kiosk;
+            }
+
+            function setKiosk(on) {
+                kiosk = on;
+                document.body.classList.toggle('kiosk', on);
+                kioskBox.checked = on;
+                if (urlKiosk === null) storageSet(KIOSK_KEY, on ? '1' : '0');
+                // Cards may change size; let charts/iframes re-measure
+                window.dispatchEvent(new Event('resize'));
+            }
+
+            const openers = [
+                document.getElementById('card-menu-toggle'),
+                document.getElementById('kiosk-cards-btn'),
+            ];
+            let lastOpener = null;
+
+            // restoreFocus: return focus to the opener on close. Skipped for
+            // outside clicks, where focus should go wherever the user clicked.
+            function toggleMenu(show, opener, restoreFocus = true) {
+                const open = show !== undefined ? show : menu.hidden;
+                if (open === !menu.hidden) return;
+                if (open) {
+                    lastOpener = opener || null;
+                    buildMenu();
+                }
+                menu.hidden = !open;
+                openers.forEach(el => el.setAttribute('aria-expanded', String(open)));
+                if (open) {
+                    const first = menu.querySelector('input');
+                    if (first) first.focus();
+                } else if (restoreFocus && lastOpener
+                           && lastOpener.offsetParent !== null) {
+                    lastOpener.focus();
+                }
+            }
+
+            // role="button" links: Space activates them like a real button
+            function activateOnSpace(el) {
+                el.addEventListener('keydown', e => {
+                    if (e.key === ' ') { e.preventDefault(); el.click(); }
+                });
+            }
+            const menuToggle = document.getElementById('card-menu-toggle');
+            const kioskToggle = document.getElementById('kiosk-toggle');
+            const kioskCardsBtn = document.getElementById('kiosk-cards-btn');
+            activateOnSpace(menuToggle);
+            activateOnSpace(kioskToggle);
+
+            menuToggle.addEventListener('click', e => {
+                e.preventDefault(); toggleMenu(undefined, menuToggle);
+            });
+            kioskToggle.addEventListener('click', e => {
+                e.preventDefault(); toggleMenu(false, null, false); setKiosk(true);
+            });
+            kioskCardsBtn.addEventListener('click', () => toggleMenu(undefined, kioskCardsBtn));
+            document.getElementById('kiosk-exit-btn').addEventListener('click', () => {
+                toggleMenu(false, null, false); setKiosk(false);
+            });
+            kioskBox.addEventListener('change', () => setKiosk(kioskBox.checked));
+            document.getElementById('card-menu-reset').addEventListener('click', () => {
+                hidden.clear(); saveHidden(); applyCardLayout(); buildMenu();
+            });
+
+            // Close the menu on outside click; Esc closes it, then leaves kiosk
+            document.addEventListener('click', e => {
+                if (!menu.hidden && !menu.contains(e.target)
+                    && !e.target.closest('#card-menu-toggle, #kiosk-cards-btn')) {
+                    toggleMenu(false, null, false);
+                }
+            });
+            document.addEventListener('keydown', e => {
+                // Leave Esc to open dialogs (e.g. the islanding confirmation)
+                if (e.defaultPrevented || document.querySelector('dialog[open]')) return;
+                if (e.key !== 'Escape') return;
+                if (!menu.hidden) toggleMenu(false);
+                else if (kiosk) setKiosk(false);
+            });
+
+            // Touch screens have no hover: a tap reveals the kiosk buttons briefly
+            let fadeTimer;
+            document.addEventListener('touchstart', () => {
+                if (!kiosk) return;
+                controls.classList.add('active');
+                clearTimeout(fadeTimer);
+                fadeTimer = setTimeout(() => controls.classList.remove('active'), 4000);
+            }, { passive: true });
+
+            // Re-balance rows when feature checks show or hide cards
+            let pending = false;
+            const observer = new MutationObserver(() => {
+                if (pending) return;
+                pending = true;
+                requestAnimationFrame(() => { pending = false; applyCardLayout(); });
+            });
+            [grid, ...cards].forEach(el => observer.observe(el, {
+                attributes: true, attributeFilter: ['class', 'style']
+            }));
+
+            applyCardLayout();
+            setKiosk(kiosk);
+        })();
     </script>
 </body>
 </html>

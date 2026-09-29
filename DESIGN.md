@@ -334,6 +334,11 @@ async def get_aggregates():
 - Graceful degradation when gateways are offline
 - Protects pypowerwall from request storms
 
+**Exceptions**: control writes and the Tesla tariff routes call the Tesla cloud
+on demand (executor + timeout). The unauthenticated tariff GET has its own
+5-minute server-side cache with a single-flight lock, and serves the last good
+tariff when a refresh fails, so clients can't turn requests into Tesla API calls.
+
 ### 3. Exponential Backoff
 
 Failed connections use progressive retry delays to prevent hammering:
@@ -363,6 +368,41 @@ Configuration uses Pydantic BaseSettings for validation and env var binding:
 class Settings(BaseSettings):
     server_port: int = Field(default=8675, validation_alias=AliasChoices('PW_PORT', 'PORT'))
 ```
+
+### 6. History and Time-Series Data
+
+The time-series store and the history UI are expected to grow over time: new
+signals, new charts, new device types. To keep that growth cheap and the server
+simple, history features follow these rules:
+
+1. **Record a curated set in code; choose views in the UI.**
+   - **What is recorded** is defined in code: a registry that maps a pypowerwall
+     signal to a metric id, plus a catalog with each metric's label, unit and
+     chart group. It is extended through reviewed PRs.
+   - **Environment variables cover only what the operator pays for:** sample
+     interval, retention, and turning recording off. They drive disk use and
+     SD-card wear on small hosts. No per-signal environment toggles.
+   - **What a user sees is a viewing choice made in the page:** series and chart
+     toggles kept in the URL and remembered in browser storage. No server-side
+     view configuration.
+2. **The UI is driven by the metric catalog.** Adding a metric, including one in a
+   new chart group, must appear in the UI without editing the page. That means one
+   chart card per catalog group, with colors assigned from a palette rather than
+   hard-coded per metric.
+3. **History pages are a zero-setup quick look, not a dashboard builder.** Custom
+   dashboards, alerting and long-term analytics belong in Powerwall-Dashboard
+   (Grafana/InfluxDB) and Home Assistant, which consume the server's APIs and
+   MQTT topics.
+4. **Recording never adds gateway calls or blocks polling.** Samples come from data
+   each poll already fetches. Database writes and queries run off the event
+   loop, and a recording failure never fails a poll.
+5. **Setting and API names are permanent once released.** Environment variables,
+   endpoint paths and response fields follow the no-breaking-changes rule, so
+   they are chosen deliberately before merge. New data is added to responses;
+   existing fields are never renamed or removed.
+6. **Shared UI code lives in one place.** Charts and helpers used by more than one
+   page (for example the Energy Trend chart) belong in a shared static script
+   that each page loads, not in copies per page.
 
 ---
 
