@@ -5,7 +5,9 @@
 
 **Fixed:**
 - **Cloud-control fallback no longer logs grid-getter errors** â€” when the hybrid cloud-control connection (cloud auth + FleetAPI both failing) degrades to pypowerwall's local client, `get_grid_charging()`/`get_grid_export()` are unsupported stubs that logged an ERROR on every poll cycle. All four cloud-control grid-getter call sites (including the Basic LAN supplementary reads) are now gated on the grid-controls support check, silencing the repeat of the #114 log spam via the cloud-control path. (#114, #129; follow-up to #117)
-
+Kent's fix 
+- **Exclude inverter solar from console dashboard and trend panel when Powerwalls exist** — Solar generation on aggregate server power totals (`total_solar_power`) and the 24h Energy Trend chart excludes standalone solar-inverter (`type: "inverter"`) gateways when Powerwall gateways are present (to avoid double-counting solar already measured by Powerwall CTs). If only solar-inverter gateways exist (no Powerwalls), inverter solar generation is included.
+- **Inverter fan speed retrieval over TEDAPI bearer mode** — Added missing `GET /api/gateways/{id}/version``GET /api/gateways/{id}/fans` and `GET /api/gateways/{id}/fans/pw` endpoints for per-gateway fan querying. Inverter fan speeds are now auto-merged into vitals and TEDAPI `bearer` auth mode auto-promotes to `V2026_06` GraphQL query set when `tedapi_api_version` is unconfigured, which is required by Tesla gateways for AuthEnvelope signed queries. Legacy `/fans` and `/fans/pw` endpoints also gain multi-gateway fallback and an optional `?gateway=` query parameter.
 ### [0.7.0] - 2026-09-26
 
 **Added:**

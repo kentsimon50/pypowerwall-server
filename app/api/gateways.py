@@ -119,6 +119,40 @@ async def get_gateway_fans(gateway_id: str):
 
     return status.data.fan_speeds or {}
 
+@router.get("/{gateway_id}/version")
+async def get_gateway_version(gateway_id: str):
+
+    """Get firmware version.
+
+    Uses graceful degradation: returns cached version even if gateway is temporarily offline.
+    """
+    
+    status = gateway_manager.get_gateway(gateway_id)
+
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Gateway {gateway_id} not found")
+
+    if not status.data:
+        return {}
+
+    version = None
+    if status and status.data:
+        version = status.data.version
+
+    if version is None:
+        return {"version": "Unknown", "vint": 0}
+
+    # Parse version string to integer (basic implementation)
+    vint = 0
+    try:
+        # Extract numbers from version string like "23.44.0"
+        parts = version.split(".")
+        if len(parts) >= 2:
+            vint = int(parts[0]) * 100 + int(parts[1])
+    except Exception:
+        pass
+
+    return {"version": version, "vint": vint}
 
 @router.get("/{gateway_id}/fans/pw")
 async def get_gateway_fans_pw(gateway_id: str):
