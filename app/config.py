@@ -87,6 +87,12 @@ Environment Variables (Proxy Compatible):
                                         no daily stats UI/API)
         PW_TIMESERIES_DAILY_RETENTION - Daily kWh aggregate retention (default: "0" =
                                         unlimited; one tiny row per gateway per day)
+        PW_TIMESERIES_SIGNAL_RETENTION - Powerwall temperature/fan sample retention
+                                        (default: "30d"; "0" = unlimited, "-1" = do
+                                        not record device signals). Daily min/avg/max
+                                        rollups follow PW_TIMESERIES_DAILY_RETENTION.
+        PW_TIMESERIES_SIGNAL_INTERVAL - Seconds between temperature/fan samples per
+                                        gateway (default: "60s"; minimum "30s")
         PW_TIMESERIES_PATH            - SQLite database path (default: /data/timeseries.db
                                         when /data exists, else data/timeseries.db).
                                         If pointed at a directory instead of a file,
@@ -199,7 +205,25 @@ from pydantic_settings import BaseSettings
 logger = logging.getLogger(__name__)
 
 # Server version
-SERVER_VERSION = "0.7.1"
+SERVER_VERSION = "0.9.0"
+
+# MQTT control bitmask values for MQTT_CONTROLS (bits only, no names).
+# Default 0 keeps MQTT monitoring-only, exactly as before controls existed.
+# Islanding (physical grid contactor!) needs its own explicit opt-in bit.
+MQTT_CONTROL_RESERVE = 1
+MQTT_CONTROL_MODE = 2
+MQTT_CONTROL_GRID_CHARGING = 4
+MQTT_CONTROL_GRID_EXPORT = 8
+MQTT_CONTROL_ISLANDING = 16
+MQTT_CONTROLS_ALL = 31
+MQTT_CONTROL_BITS = {
+    "reserve": MQTT_CONTROL_RESERVE,
+    "mode": MQTT_CONTROL_MODE,
+    "grid_charging": MQTT_CONTROL_GRID_CHARGING,
+    "grid_export": MQTT_CONTROL_GRID_EXPORT,
+    "islanding": MQTT_CONTROL_ISLANDING,
+}
+_MQTT_CONTROL_NAMES = {bit: name for name, bit in MQTT_CONTROL_BITS.items()}
 
 
 class GatewayConfig(BaseModel):
@@ -385,6 +409,12 @@ class Settings(BaseSettings):
     timeseries_daily_retention: str = Field(
         default="0", alias="PW_TIMESERIES_DAILY_RETENTION"
     )  # Daily aggregate retention; "0" = unlimited (default)
+    timeseries_signal_retention: str = Field(
+        default="30d", alias="PW_TIMESERIES_SIGNAL_RETENTION"
+    )  # Temperature/fan sample retention; "-1" = don't record, "0" = unlimited
+    timeseries_signal_interval: str = Field(
+        default="60s", alias="PW_TIMESERIES_SIGNAL_INTERVAL"
+    )  # Minimum seconds between temperature/fan samples per gateway
     timeseries_path: Optional[str] = Field(
         default=None, alias="PW_TIMESERIES_PATH"
     )  # SQLite file path; resolved in __init__ (/data aware)
@@ -405,11 +435,65 @@ class Settings(BaseSettings):
     mqtt_ha_prefix: str = Field(default="homeassistant", alias="MQTT_HA_PREFIX")
     mqtt_client_id: str = Field(default="pypowerwall-server", alias="MQTT_CLIENT_ID")
     mqtt_keepalive: int = Field(default=60, alias="MQTT_KEEPALIVE")
+    mqtt_controls: int = Field(
+        default=0, alias="MQTT_CONTROLS"
+    )  # Bitmask opt-in for MQTT controls (0 = monitoring only; 1 reserve,
+    # 2 mode, 4 grid_charging, 8 grid_export, 16 islanding; e.g. 15 = all
+    # but islanding, 31 = all). Islanding needs its own explicit bit.
+
+    @field_validator("mqtt_controls", mode="before")
+    @classmethod
+    def _parse_control_bits(cls, v) -> int:
+        """Fail closed: anything but an integer 0-31 means monitoring only.
+
+        An invalid value must neither stop the server (monitoring keeps
+        running) nor enable controls the user didn't spell out.
+        """
+        text = str(v).strip()
+        if text == "":
+            return 0  # unset, e.g. MQTT_CONTROLS= in a compose file
+        if text.isdigit() and 0 <= int(text) <= MQTT_CONTROLS_ALL:
+            return int(text)
+        logger.error(
+            f"Invalid MQTT_CONTROLS={text!r}: must be an integer from 0 to "
+            f"{MQTT_CONTROLS_ALL}; MQTT controls stay off (monitoring only)"
+        )
+        return 0
+
+    def mqtt_control_names(self) -> List[str]:
+        """Names of the enabled MQTT controls, for startup logging."""
+        return [
+            _MQTT_CONTROL_NAMES[bit]
+            for bit in sorted(_MQTT_CONTROL_NAMES)
+            if self.mqtt_controls & bit
+        ]
+
+    def mqtt_control_allowed(self, control: str) -> bool:
+        """True when the MQTT_CONTROLS bitmask enables this control."""
+        return bool(
+            self.mqtt_controls & MQTT_CONTROL_BITS.get(control, 0)
+        )
 
     @property
     def mqtt_enabled(self) -> bool:
         """MQTT publishing is enabled when MQTT_HOST is set."""
         return bool(self.mqtt_host)
+
+    @property
+    def mqtt_controls_available(self) -> bool:
+        """MQTT controls are on: bits set, PW_CONTROL_SECRET set, and we
+        connect with MQTT_USERNAME/MQTT_PASSWORD.
+
+        This only checks our own credentials. It can't tell whether the
+        broker rejects anonymous clients or enforces the control-topic ACL;
+        the broker must do both (see MQTT.md)."""
+        return bool(
+            self.mqtt_host
+            and self.mqtt_username
+            and self.mqtt_password
+            and self.mqtt_controls != 0
+            and self.control_secret
+        )
 
     # Gateway configuration
     gateways: List[GatewayConfig] = Field(default_factory=list)

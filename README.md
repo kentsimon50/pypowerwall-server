@@ -19,7 +19,7 @@ The **Control** panel allows you to manage the Powerwall's operation mode, reser
 
 <img alt="PyPowerwall Server Console - Control" src="https://github.com/user-attachments/assets/2f33dc25-8f9c-412c-893f-087d6ba9c57d" />
 
-The **MQTT** panel shows the live MQTT settings if the `PW_MQTT_BROKER` environment variable is set.
+The **MQTT** panel shows the live MQTT settings if the `MQTT_HOST` environment variable is set.
 
 <img alt="PyPowerwall Server Console - MQTT" src="https://github.com/user-attachments/assets/f57aff54-5e6e-4a85-a3dc-ec7892a2369d" />
 
@@ -30,8 +30,9 @@ The **MQTT** panel shows the live MQTT settings if the `PW_MQTT_BROKER` environm
 - **Real-Time Updates** - WebSocket streaming with 1-second updates and background polling with intelligent caching
 - **Complete API** - Full backward compatibility with pypowerwall proxy plus new multi-gateway and aggregate endpoints
 - **Console Web UI** - Tesla Power Flow animation, management console, and auto-generated API documentation at /docs
+- **History** - Daily energy totals for any date range plus Powerwall temperature and fan history at `/history`, stored locally in SQLite
 - **Optional Control Mode** - Token-protected `/control/*` API to set backup reserve and operating mode, plus a Powerwall Control card in the web Console (enabled by `PW_CONTROL_SECRET`; read-only by default)
-- **MQTT Integration** - Publish live Powerwall metrics to any MQTT broker; built-in Home Assistant auto-discovery; see [mqtt-tools/README.md](mqtt-tools/README.md)
+- **MQTT Integration** - Publish live Powerwall metrics to any MQTT broker; built-in Home Assistant auto-discovery; optional Home Assistant controls (opt-in with `MQTT_CONTROLS`, use at your own risk); see [mqtt-tools/README.md](mqtt-tools/README.md)
 
 ## Quick Start
 
@@ -91,7 +92,7 @@ docker run -d \
 
 > **Note:** `PW_WIFI_HOST` is the IP address pypowerwall uses for the WiFi fallback path in v1r mode. It defaults to `192.168.91.1`. Only set it if your gateway is on a different IP (e.g. behind a travel router).
 >
-> **Note:** The `-v pws-data:/data` mount persists the daily energy history (SQLite time-series store) across container upgrades. Omit it if you run with `PW_TIMESERIES_RETENTION=-1` (subsystem disabled).
+> **Note:** The `-v pws-data:/data` mount persists the daily energy, temperature and fan history (SQLite time-series store) across container upgrades. Omit it if you run with `PW_TIMESERIES_RETENTION=-1` (subsystem disabled).
 
 #### Basic LAN Mode (Powerwall 3, No Gateway Password or RSA Key)
 
@@ -312,6 +313,8 @@ Raise it if a slow local gateway logs poll timeouts.
 PW_TIMESERIES_RETENTION=24h            # Raw 5s sample retention (default: 24h)
 PW_TIMESERIES_DAILY_RETENTION=0        # Daily kWh aggregate retention (default: 0 = unlimited)
 PW_TIMESERIES_PATH=/data/timeseries.db  # SQLite path (default: /data/timeseries.db if /data exists)
+PW_TIMESERIES_SIGNAL_RETENTION=30d     # Temperature/fan sample retention (default: 30d; 0 = unlimited; -1 = don't record)
+PW_TIMESERIES_SIGNAL_INTERVAL=60s      # Seconds between temperature/fan samples (default: 60s; minimum 30s)
 ```
 The server records every poll cycle's power readings to a local SQLite
 store (WAL mode) and derives daily energy totals per gateway via trapezoidal
@@ -333,6 +336,73 @@ integrated — no fabricated energy. Set `PW_TIMESERIES_RETENTION=-1` to
 disable the subsystem entirely for headless proxy deployments (no SQLite
 file, no writes, UI panel hidden). Retention accepts `90s`, `48h`, `7d`,
 `30d`, `365d` style values; `0` = unlimited.
+
+**Powerwall temperatures and fans.** The same store records each
+Powerwall's temperatures (battery pack max/min, shunt, inverter ambient;
+Powerwall 2 ambient) and inverter fans (speed in rpm and duty cycle in %)
+once per `PW_TIMESERIES_SIGNAL_INTERVAL`: `60s` by default, or `30s` (the
+minimum) for finer detail. Lower values are raised to 30s with a warning:
+these readings change slowly, and finer sampling mostly costs disk and
+SD-card wear.
+The readings come from the vitals and fan data each poll already fetches,
+so this adds no gateway calls; they need a TEDAPI connection (Powerwall 3
+temperatures need pypowerwall 0.17.4 or later). A daily low/average/high
+for every signal is kept alongside, under `PW_TIMESERIES_DAILY_RETENTION`,
+so long-range history survives the raw samples being pruned. Set
+`PW_TIMESERIES_SIGNAL_RETENTION=-1` to stop recording them while keeping
+energy history.
+
+Disk use for the raw samples, per Powerwall 3 (8 signals):
+
+| `PW_TIMESERIES_SIGNAL_INTERVAL` | Per day | 7 days | 30 days (default retention) |
+|---|---|---|---|
+| `60s` (default) | ~0.4 MB | ~3 MB | ~12 MB |
+| `30s` (minimum) | ~0.8 MB | ~6 MB | ~24 MB |
+
+**History page (`/history`).** Look up daily energy for any date range
+(1 hour to all stored history) with range totals, a per-day chart, a
+table and CSV download. On the **1h / 6h / 24h** ranges the energy card
+instead shows the same **Energy Trend** chart as the console: solar, home,
+battery and grid kW plus battery level % on the right axis, from the raw
+samples kept for `PW_TIMESERIES_RETENTION`.
+
+Below it the page draws **one chart card per signal group** (Powerwall
+temperatures, Fan speed, Fan duty cycle), built entirely from the catalog
+at `/api/timeseries/signals`: a new metric, or a whole new group, appears
+with no page changes. Each card shows **Show** toggles when a group has
+several metrics, and low / average / high / last values for the range (the
+average is weighted by sample count; hover a value for its time). The
+temperature card has its own °C/°F switch in its header. With more than one
+Powerwall, an **All / PW1 / PW2 …** selector shows one unit at a time, or
+all of them told apart by line style. Units are numbered by the server
+exactly as the Console and `/pod` number them (battery-list order, with
+expansion packs labelled after their leader, e.g. `PW1 Exp 1`), and every
+series from `/api/timeseries/signals` and `/signal_trend` carries that
+`powerwall` label. Ranges up to 14 days use the raw samples, averaged into
+about 360 steps per chart (never finer than `PW_TIMESERIES_SIGNAL_INTERVAL`,
+with the low/high of each step); longer ranges, and any request that would
+scan more than about 500k raw rows, use the daily low/average/high. The **1h** and **6h** ranges show
+every stored sample and refresh every minute; the energy card shows today
+for those ranges, since energy is totalled per day.
+
+The page opens at **24h**, or at the last range preset you picked in that
+browser. The range, gateway, selected Powerwall (`pw=`) and any series you
+switch off (`hide=`, also remembered in the browser) are kept in the URL,
+so a view can be bookmarked, e.g. `/history?range=90d` or
+`/history?range=6h&pw=PW2&hide=fan_b_rpm`. Under `PROXY_BASE_URL` it is at
+`<base>/history`. The Console's Energy Trend and the History charts share
+one script, `app/static/js/charts.js`, and stylesheet,
+`app/static/css/charts.css`.
+
+The History page has the same header as the Console, with the same **Cards**
+and **Kiosk** controls (see [Card Visibility and Kiosk Mode](#card-visibility-and-kiosk-mode)).
+**Cards** shows or hides the Daily energy card and each chart card (hidden
+cards stay hidden as the charts reload); **Kiosk** hides the header but keeps
+the range controls. Both are saved in the browser (`pw_history_hidden_cards`,
+`pw_history_kiosk`), and `/history?kiosk=1` starts in kiosk mode without
+saving it. There is no URL parameter for cards here, since `hide=` already
+lists the switched-off series. The header, Cards menu and kiosk mode are
+shared by both pages in `app/static/js/page.js` and `app/static/css/page.css`.
 
 ### Configuration File (gateways.yaml)
 
@@ -510,10 +580,12 @@ The default budget (1000 requests / 60s per IP) is set well above a normal dashb
 ## Console
 
 The management console is at `/console` (the Power Flow animation is at `/`).
+The **History** link in the console header (and on the Daily Energy card)
+opens the History page at `/history` (see **History page** under Environment Variables).
 
 ### Card Visibility and Kiosk Mode
 
-Use **Cards** in the console header to show or hide individual cards; the remaining cards in a row widen to fill the space. **Kiosk** hides the header and status banner for a wall display or tablet. The status banner reappears if the server loses its gateway connection, so stale data is never shown without a warning. In kiosk mode, faint **Cards** and **Exit kiosk** buttons sit in the top-right corner (hover, tap or tab to them), and Esc exits. These choices are saved in the browser.
+Use **Cards** in the console header to show or hide individual cards; the remaining cards in a row widen to fill the space. **Kiosk** hides the header and status banner for a wall display or tablet. The status banner reappears if the server loses its gateway connection, so stale data is never shown without a warning. In kiosk mode, faint **Cards** and **Exit kiosk** buttons sit in the top-right corner (hover, tap or tab to them), and Esc exits. These choices are saved in the browser. The History page has the same header, **Cards** menu and **Kiosk** mode, with its own saved choices (see **History page** under Environment Variables).
 
 A kiosk browser can be configured by URL instead. URL parameters override the saved choices and are not saved:
 
@@ -563,8 +635,36 @@ export MQTT_HA_DISCOVERY=true        # auto-configure Home Assistant sensors (de
 | `MQTT_HA_PREFIX` | `homeassistant` | HA discovery prefix |
 | `MQTT_CLIENT_ID` | `pypowerwall-server` | MQTT client identifier |
 | `MQTT_KEEPALIVE` | `60` | Connection keepalive in seconds |
+| `MQTT_CONTROLS` | `0` | Opt-in Home Assistant controls. **Use at your own risk: read the warning below first.** `0` = monitoring only |
 
-Topics are published under `{MQTT_TOPIC_PREFIX}/{gateway_id}/` — e.g. `pypowerwall/default/battery`, `pypowerwall/default/solar`, etc. See [mqtt-tools/README.md](mqtt-tools/README.md) for the full topic list, broker setup guide, Home Assistant integration steps, and the live monitor GUI.
+Topics are published under `{MQTT_TOPIC_PREFIX}/{gateway_id}/` — e.g. `pypowerwall/default/battery`, `pypowerwall/default/solar`, etc. Per-unit Powerwall temperatures and fan speeds are published under `devices/{serial}/…` (e.g. `pypowerwall/default/devices/TG2312H0001/fan/a/rpm`) and show up as Home Assistant sensors when discovery is enabled. See [mqtt-tools/README.md](mqtt-tools/README.md) for the full topic list, broker setup guide, Home Assistant integration steps, and the live monitor GUI.
+
+### Home Assistant Controls (opt-in)
+
+> **⚠️ WARNING: USE AT YOUR OWN RISK**
+>
+> MQTT controls let anything allowed to publish to the control topics on your MQTT broker (`{MQTT_TOPIC_PREFIX}/+/control/+/set`; on a broker without an ACL, that's every client) change how your Powerwall runs: the backup reserve, the operating mode, grid charging and grid export, and (with `16`) disconnecting your home from the grid. A misconfigured or compromised broker, a hacked smart-home device, a buggy automation or a simple mistake could:
+>
+> - cause a **power outage** in your home,
+> - leave you **without backup power** when the grid goes down (for example, a reserve set to 0),
+> - **damage** equipment or appliances, or
+> - raise your energy costs or conflict with your utility agreement.
+>
+> This software is provided "as is", without warranty of any kind (see the [MIT license](LICENSE)), and is not made or supported by Tesla. **By setting `MQTT_CONTROLS` to anything other than `0`, you acknowledge these risks and accept full responsibility for the results.** Think twice before turning this on: enable only the controls you need, leave going off grid (`16`) off unless you truly need it, and secure your broker first.
+
+By default MQTT only publishes. Set `MQTT_CONTROLS` to let Home Assistant (or any MQTT client allowed by your broker) change Powerwall settings. Add the numbers of the controls you want:
+
+| Value | Control | Home Assistant entity |
+|-------|---------|-----------------------|
+| `1` | Backup reserve (0-100 %) | number |
+| `2` | Operating mode (`self_consumption`, `backup`, `autonomous`) | select |
+| `4` | Grid charging | switch |
+| `8` | Grid export (`battery_ok`, `pv_only`, `never`) | select |
+| `16` | Go off grid / reconnect (TEDAPI v1r only) | two buttons |
+
+For example `MQTT_CONTROLS=15` enables everything except going off grid, which needs its own `16` (`31` = all). Controls also need `PW_CONTROL_SECRET`, `MQTT_USERNAME` and `MQTT_PASSWORD`; the log says which one is missing. Home Assistant only gets the controls your connection can run: reserve, mode and the grid settings need cloud, FleetAPI, hybrid cloud or TEDAPI v1r, and going off grid needs v1r.
+
+> **Secure your broker first.** The control secret is never sent over MQTT: anyone who can publish to `{MQTT_TOPIC_PREFIX}/+/control/#` (default prefix `pypowerwall`) on your broker can change these settings. Turn off anonymous access and limit who can publish to the control topics — see [Securing the broker](MQTT.md#securing-the-broker-required-for-controls) for a Mosquitto example. Topics, payloads and rules are in [MQTT.md](MQTT.md#control-command-topics-opt-in-mqtt_controls).
 
 ## API Endpoints
 
@@ -658,12 +758,16 @@ return `503`; a Tesla-side error returns `502`, and an invalid POST body `400`.
 - `GET /api/aggregate/soe` - Total battery capacity and charge
 - `GET /api/aggregate/status` - Health status of all gateways
 
-**Time-Series Endpoints (Daily Energy):**
+**Time-Series Endpoints (Daily Energy, Temperatures, Fans):**
 - `GET /api/timeseries/today` - Today's running kWh totals per gateway
-- `GET /api/timeseries/daily?days=7` - Daily kWh totals (per gateway/category)
+- `GET /api/timeseries/daily?days=7` - Daily kWh totals (per gateway/category); `start`/`end` (`YYYY-MM-DD`) select any range of local days instead, e.g. `?start=2026-01-01&end=2026-06-30`
 - `GET /api/timeseries/trend?hours=24` - Bucketed kW + battery level for charting (per-gateway mean, summed across gateways)
 - `GET /api/timeseries/samples` - Raw samples (troubleshooting; filters: `gateway`, `start`, `end`, `limit`) — includes battery level (`soe`)
 - `GET /api/timeseries/status` - Subsystem status, retention settings, DB size
+- `GET /api/timeseries/signals` - Recorded temperature/fan series per gateway and device (each with its `powerwall` label, e.g. `PW1` / `PW1 Exp 1`, and the time range it covers), plus the `metrics` / `groups` catalog and gateway names
+- `GET /api/timeseries/signal_trend` - Temperature/fan history for charting, with avg/min/max and sample count per point (filters: `metrics`, `gateway`, `devices`, `start`, `end`, `hours`; `resolution=auto|raw|daily`; `raw` is served as daily beyond 14 days or ~500k rows)
+
+On `/signal_trend`, `start` / `end` are epoch seconds between 0 and 4102444800 (2100-01-01); other values return 422. `/trend` rejects only non-finite values (`nan`, `inf`).
 
 All report `{"enabled": false, ...}` when disabled (`PW_TIMESERIES_RETENTION=-1`).
 
@@ -913,6 +1017,7 @@ pypowerwall-server/
 │   │   └── transform.py        # UI data transformations
 │   └── static/
 │       ├── index.html          # Management console
+│       ├── history.html        # History page (/history)
 │       ├── example.html        # iFrame demo
 │       └── powerflow/          # Power flow UI assets
 ├── tests/

@@ -95,6 +95,7 @@ All use `MQTT_` prefix (no `PW_` prefix — MQTT is not a Powerwall concept).
 | `MQTT_HA_PREFIX` | `homeassistant` | HA discovery topic prefix |
 | `MQTT_CLIENT_ID` | `pypowerwall-server` | MQTT client identifier |
 | `MQTT_KEEPALIVE` | `60` | Broker keepalive interval (seconds) |
+| `MQTT_CONTROLS` | `0` | Opt-in bitmask for Home Assistant controls (needs `PW_CONTROL_SECRET` and `MQTT_USERNAME`/`MQTT_PASSWORD`): `1` reserve, `2` mode, `4` grid_charging, `8` grid_export, `16` islanding. `15` = all but islanding, `31` = all, `0` = monitoring only. Any other value is logged as an error and treated as `0`. **Use at your own risk** (see the warning under *Control command topics*) |
 
 Add to `app/config.py` Settings class:
 
@@ -114,10 +115,21 @@ mqtt_ha_discovery: bool = Field(default=True, alias="MQTT_HA_DISCOVERY")
 mqtt_ha_prefix: str = Field(default="homeassistant", alias="MQTT_HA_PREFIX")
 mqtt_client_id: str = Field(default="pypowerwall-server", alias="MQTT_CLIENT_ID")
 mqtt_keepalive: int = Field(default=60, alias="MQTT_KEEPALIVE")
+mqtt_controls: int = Field(default=0, alias="MQTT_CONTROLS")
 
 @property
 def mqtt_enabled(self) -> bool:
     return bool(self.mqtt_host)
+
+@property
+def mqtt_controls_available(self) -> bool:
+    return bool(
+        self.mqtt_host
+        and self.mqtt_username
+        and self.mqtt_password
+        and self.mqtt_controls != 0
+        and self.control_secret
+    )
 ```
 
 ---
@@ -148,6 +160,63 @@ Base path: `{MQTT_TOPIC_PREFIX}/{gateway_id}/`
 
 Optional topics are published only when the source value is available; the
 last retained value persists until the gateway's `availability` goes `offline`.
+
+### Control command topics (opt-in `MQTT_CONTROLS`)
+
+> **⚠️ WARNING: USE AT YOUR OWN RISK**
+>
+> MQTT controls let anything allowed to publish to the control topics on your MQTT broker (`{MQTT_TOPIC_PREFIX}/+/control/+/set`; on a broker without an ACL, that's every client) change how your Powerwall runs: the backup reserve, the operating mode, grid charging and grid export, and (with `16`) disconnecting your home from the grid. A misconfigured or compromised broker, a hacked smart-home device, a buggy automation or a simple mistake could:
+>
+> - cause a **power outage** in your home,
+> - leave you **without backup power** when the grid goes down (for example, a reserve set to 0),
+> - **damage** equipment or appliances, or
+> - raise your energy costs or conflict with your utility agreement.
+>
+> This software is provided "as is", without warranty of any kind (see the [MIT license](LICENSE)), and is not made or supported by Tesla. **By setting `MQTT_CONTROLS` to anything other than `0`, you acknowledge these risks and accept full responsibility for the results.** Think twice before turning this on: enable only the controls you need, leave going off grid (`16`) off unless you truly need it, and secure your broker first.
+
+| Topic | Bit | Payload | Accepted values |
+|-------|-----|---------|-----------------|
+| `{prefix}/{gw}/control/reserve/set` | `1` | `{"value": 20}` | integer `0`-`100` |
+| `{prefix}/{gw}/control/mode/set` | `2` | `{"value": "self_consumption"}` | `self_consumption`, `backup`, `autonomous` |
+| `{prefix}/{gw}/control/grid_charging/set` | `4` | `{"value": true}` | `true`, `false` (JSON booleans) |
+| `{prefix}/{gw}/control/grid_export/set` | `8` | `{"value": "battery_ok"}` | `battery_ok`, `pv_only`, `never` |
+| `{prefix}/{gw}/control/islanding/set` | `16` | `{"action": "off_grid", "confirm": true}` | `off_grid`, `on_grid`, always with `"confirm": true` |
+
+How commands run:
+
+- **Where they can run.** Reserve, mode and the two grid settings need a gateway that can write them: cloud, FleetAPI, the hybrid cloud connection (only for the gateway it was built for, and only when its Tesla site is certain, see below), or a v1r connection. Islanding needs a confirmed v1r connection (Powerwall 2 or 3) and goes over it directly, with the server's islanding cooldown (`PW_ISLANDING_COOLDOWN`, 30 s by default). It is reported as applied only when the gateway acknowledges it (`result == 1`). Home Assistant only gets the controls a gateway can run; commands for anything else are rejected with a warning.
+- **One write per command.** Each command runs on exactly one connection and is never retried on another one. A burst of commands for the same control (a slider drag) collapses to the latest one.
+- **Not retained.** Publish with `retain=false` (Home Assistant does). A retained command is never replayed: after each command the server deletes any retained copy of it, and a retained command found on connect is ignored with a warning.
+- **Logged.** Every applied command is logged at INFO with gateway, control, value and connection; rejected or failed commands at WARNING.
+- **Bits off.** Turning a bit off (or controls off) removes the entity from Home Assistant on the next start.
+- **Hybrid site.** If the Tesla account has more than one site, set `PW_SITEID` (or pick the site with `pypowerwall setup`); otherwise the hybrid cloud connection could point at another site, so MQTT controls don't use it.
+
+### Securing the broker (required for controls)
+
+`PW_CONTROL_SECRET` is never sent over MQTT: anyone who can publish to `{prefix}/+/control/#` can operate every enabled control. The server checks that it connects with `MQTT_USERNAME`/`MQTT_PASSWORD`, but it can't see whether the broker rejects anonymous clients or limits who may publish there. The broker has to do both. A Mosquitto example:
+
+```conf
+# mosquitto.conf
+allow_anonymous false
+password_file /mosquitto/config/passwd
+acl_file /mosquitto/config/acl
+```
+
+```conf
+# acl: pypowerwall-server publishes everything, reads commands and clears them;
+# Home Assistant reads state and sends commands; nobody else touches control topics.
+# Replace pypowerwall with your MQTT_TOPIC_PREFIX if you changed it.
+user pypowerwall
+topic readwrite pypowerwall/#
+topic write homeassistant/#
+
+user homeassistant
+topic read pypowerwall/#
+topic write pypowerwall/+/control/+/set
+topic readwrite homeassistant/#
+```
+
+Islanding (bit `16`) opens the grid contactor, so it needs its own bit: `MQTT_CONTROLS=15` enables everything else.
 
 ### Lifetime energy topics (Wh accumulators)
 
@@ -237,6 +306,36 @@ Sourced from `pw.vitals()`'s `TRM--{din}` blocks — requires pypowerwall
 ≥ 0.18.2 in TEDAPI modes (Basic LAN skips vitals) and a gateway with at least
 one remote meter configured; silently absent otherwise, same as solar strings.
 
+### Per-unit Powerwall temperature and fan topics
+
+One set of topics per physical Powerwall unit, keyed by that unit's serial
+number (`{serial}` — the same units as the web console's Powerwall Status
+table). Each unit publishes only the signals it actually reports: Powerwall 3
+units (and their expansion packs) carry the temperature topics and fans
+A/B, Powerwall 2/+ units carry the thermal-controller temperature and the
+single fan (rpm + target). Rounding follows the signal registry (whole rpm,
+one decimal elsewhere):
+
+| Topic | Value | Unit |
+|-------|-------|------|
+| `pypowerwall/{gw}/devices/{serial}/temperature/pack_max` | `23.4` | `°C` (PW3 battery pack max) |
+| `pypowerwall/{gw}/devices/{serial}/temperature/pack_min` | `22.1` | `°C` (PW3 battery pack min) |
+| `pypowerwall/{gw}/devices/{serial}/temperature/shunt` | `24.0` | `°C` (PW3 shunt) |
+| `pypowerwall/{gw}/devices/{serial}/temperature/ambient` | `31.2` | `°C` (PW3 inverter enclosure) |
+| `pypowerwall/{gw}/devices/{serial}/temperature/controller` | `21.5` | `°C` (PW2/+ thermal controller) |
+| `pypowerwall/{gw}/devices/{serial}/fan/a/rpm` | `1200` | `rpm` (PW3 fan A) |
+| `pypowerwall/{gw}/devices/{serial}/fan/a/duty` | `35.5` | `%` (PW3 fan A duty) |
+| `pypowerwall/{gw}/devices/{serial}/fan/b/rpm` | `1180` | `rpm` (PW3 fan B) |
+| `pypowerwall/{gw}/devices/{serial}/fan/b/duty` | `33.2` | `%` (PW3 fan B duty) |
+| `pypowerwall/{gw}/devices/{serial}/fan/rpm` | `810` | `rpm` (PW2/+ fan) |
+| `pypowerwall/{gw}/devices/{serial}/fan/target_rpm` | `900` | `rpm` (PW2/+ fan target) |
+| `pypowerwall/{gw}/devices/{serial}` | `{"pack_temp_max": 23.4, ...}` | JSON (full per-unit set) |
+
+Sourced from the existing `pw.vitals()` poll plus the `get_fan_speeds()`
+cache — no new gateway calls. Available in TEDAPI modes (Basic LAN skips
+vitals); absent in cloud-only mode, and silently absent per-signal when a unit
+doesn't report it.
+
 ---
 
 ## Home Assistant Auto-Discovery
@@ -297,6 +396,16 @@ Binary sensors:
 | Grid Connected | `connectivity` |
 | Grid Charging | — |
 
+Controls (opt-in `MQTT_CONTROLS`, use at your own risk; only enabled bits the gateway can run are announced):
+| Entity | Bit | HA type | Options / Range | Icon |
+|--------|-----|---------|-----------------|------|
+| Backup Reserve Control | `1` | `number` | `0-100 %` `step 1` | `mdi:battery-lock` |
+| Operation Mode Control | `2` | `select` | `self_consumption`, `backup`, `autonomous` | `mdi:cog` |
+| Grid Charging Control | `4` | `switch` | `ON` `{"value":true}` / `OFF` `{"value":false}` | `mdi:battery-charging-outline` |
+| Grid Export Control | `8` | `select` | `battery_ok`, `pv_only`, `never` | `mdi:transmission-tower-export` |
+| Go Off Grid | `16` | `button` | `{"action":"off_grid","confirm":true}`, v1r only | `mdi:transmission-tower-off` |
+| Reconnect Grid | `16` | `button` | `{"action":"on_grid","confirm":true}`, v1r only | `mdi:transmission-tower` |
+
 Remote meter sensors (one set of five per CT, `entity_category: diagnostic`,
 named e.g. `Remote Meter EM…B10BC CT0 (solar) Voltage`, unique ID
 `pypowerwall_{gw}_remote_meter_{din_slug}_ct{n}_{metric}` where `din_slug` is
@@ -311,6 +420,20 @@ the DIN lower-cased with non-alphanumerics replaced by `_`):
 
 Solar-string and remote-meter sensors are discovered when a poll first
 reports them, including on a later poll if the first one didn't.
+
+Per-unit temperature/fan sensors (`entity_category: diagnostic`,
+`state_class: measurement`, temperature sensors carry HA `device_class:
+temperature`), named e.g. `Powerwall TG2312H0001 Pack temp (max)`, unique ID
+`pypowerwall_{gw}_device_{serial_slug}_{metric_id}` where `serial_slug` is the
+unit serial lower-cased (e.g. `pypowerwall_default_device_tg2312h0001_pack_temp_max`;
+a serial that isn't plain upper-case alphanumeric is slugged with `_` and gets
+a short hash of the exact serial appended, so two units never share an
+entity) and `metric_id` is one of `pack_temp_max`, `pack_temp_min`,
+`shunt_temp`, `inverter_ambient`, `controller_ambient`, `fan_a_rpm`,
+`fan_b_rpm`, `fan_a_duty`, `fan_b_duty`, `fan_rpm`, `fan_target_rpm` — the
+canonical ids from `app/core/signals.py`, frozen once released. Like
+strings and remote meters, each unit's sensors are discovered when a poll
+first reports them, including on a later poll.
 
 ---
 
@@ -451,7 +574,7 @@ Powerwall (default)
 - `MQTT_PASSWORD` is never logged or exposed in API responses
 - TLS support (`MQTT_TLS=yes`) for production broker connections
 - `MQTT_TLS_INSECURE` defaults to `no` — must be explicitly enabled for dev
-- No MQTT subscribe / inbound command handling in this design (publish-only); control commands remain exclusively through the existing `POST /control/*` HTTP endpoints
+- With `MQTT_CONTROLS=0` (the default) the server subscribes to nothing and MQTT is publish-only. Turning controls on is at your own risk: misuse or abuse can cause power outages or damage (see the warning under *Control command topics*). With controls on, the broker is the trust boundary: it must reject anonymous clients and restrict `{prefix}/+/control/#` (see *Securing the broker*). HTTP `POST /control/*` keeps its `Bearer <PW_CONTROL_SECRET>` check.
 
 
 ## Test Instructions - Quick Start

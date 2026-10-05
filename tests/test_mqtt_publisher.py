@@ -1120,3 +1120,395 @@ class TestGridBackupTopics:
             ]
         )
         assert summary["grid_connected"] is None
+
+
+class TestMqttDeviceSignalTopics:
+    """Verify per-unit Powerwall temperature/fan MQTT topics are published
+    correctly - sourced from vitals + get_fan_speeds(), mirroring the
+    strings and remote-meter publishing patterns."""
+
+    def _make_publisher(self, monkeypatch) -> MqttPublisher:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "mqtt_host", "localhost")
+        monkeypatch.setattr(settings, "mqtt_port", 1883)
+        monkeypatch.setattr(settings, "mqtt_topic_prefix", "pypowerwall")
+        monkeypatch.setattr(settings, "mqtt_qos", 1)
+        monkeypatch.setattr(settings, "mqtt_retain", True)
+        pub = MqttPublisher()
+        mock_client = AsyncMock()
+        pub._client = mock_client
+        pub._connected = True
+        return pub
+
+    def _make_status_with_vitals(
+        self, vitals: dict, fan_speeds: dict | None = None
+    ) -> GatewayStatus:
+        gateway = Gateway(
+            id="test-gw", name="Test", host="192.168.91.1", gw_pwd="test", online=True
+        )
+        data = PowerwallData(
+            soe=80.0,
+            soe_raw=82.0,
+            aggregates={
+                "solar": {"instant_power": 5000.0},
+                "site": {"instant_power": 0.0},
+                "load": {"instant_power": 5000.0},
+                "battery": {"instant_power": 0.0},
+            },
+            grid_status="UP",
+            mode="self_consumption",
+            reserve=20.0,
+            version="23.44.0",
+            vitals=vitals,
+            fan_speeds=fan_speeds,
+            timestamp=1_000_000.0,
+        )
+        return GatewayStatus(
+            gateway=gateway, data=data, online=True, last_updated=1_000_000.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_pw3_unit_topics_published(self, monkeypatch):
+        """A PW3 unit publishes pack/inverter temps and both fans (rpm as
+        whole numbers, duty and temps to one decimal)."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TEPOD--1081100-38-F--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "HVP_PackTempMax": 23.45,
+                    "HVP_PackTempMin": 22.12,
+                    "HVP_ShuntTemperature": 24.0,
+                },
+                "TEPINV--1707000-21-M--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "PCH_AmbientTemp": 31.24,
+                    "PCH_FanSpeed_A": 1200.0,
+                    "PCH_FanDuty_A": 35.55,
+                    "PCH_FanSpeed_B": 1180.0,
+                    "PCH_FanDuty_B": 33.2,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+
+        published = {c.args[0]: c.args[1] for c in pub._client.publish.call_args_list}
+        prefix = "pypowerwall/test-gw/devices/TG2312H0001"
+
+        assert published[f"{prefix}/temperature/pack_max"] == "23.4"
+        assert published[f"{prefix}/temperature/pack_min"] == "22.1"
+        assert published[f"{prefix}/temperature/shunt"] == "24.0"
+        assert published[f"{prefix}/temperature/ambient"] == "31.2"
+        assert published[f"{prefix}/fan/a/rpm"] == "1200"
+        assert published[f"{prefix}/fan/a/duty"] == "35.5"
+        assert published[f"{prefix}/fan/b/rpm"] == "1180"
+        assert published[f"{prefix}/fan/b/duty"] == "33.2"
+
+    @pytest.mark.asyncio
+    async def test_pw2_unit_topics_published(self, monkeypatch):
+        """A PW2 unit publishes controller temp and single-fan rpm/target."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TETHC--1081100-08-C--TG123456789": {
+                    "serialNumber": "TG123456789",
+                    "THC_AmbientTemp": 25.02,
+                },
+                "PVAC--1081100-08-C--TG123456789": {
+                    "PVAC_Fan_Speed_Actual_RPM": 810,
+                    "PVAC_Fan_Speed_Target_RPM": 900,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+
+        published = {c.args[0]: c.args[1] for c in pub._client.publish.call_args_list}
+        prefix = "pypowerwall/test-gw/devices/TG123456789"
+
+        assert published[f"{prefix}/temperature/controller"] == "25.0"
+        assert published[f"{prefix}/fan/rpm"] == "810"
+        assert published[f"{prefix}/fan/target_rpm"] == "900"
+        # No PW3 fan entities for a PW2 unit
+        assert f"{prefix}/fan/a/rpm" not in published
+        assert f"{prefix}/fan/a/duty" not in published
+
+    @pytest.mark.asyncio
+    async def test_fan_speeds_only_publishes(self, monkeypatch):
+        """fan_speeds alone (vitals absent) still publishes fan topics."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            None,
+            {
+                "PVAC--1081100-08-C--TG123456789": {
+                    "PVAC_Fan_Speed_Actual_RPM": 810,
+                    "PVAC_Fan_Speed_Target_RPM": 900,
+                }
+            },
+        )
+        await pub.publish_gateway("test-gw", status)
+
+        published = {c.args[0]: c.args[1] for c in pub._client.publish.call_args_list}
+        prefix = "pypowerwall/test-gw/devices/TG123456789"
+        assert published[f"{prefix}/fan/rpm"] == "810"
+        assert published[f"{prefix}/fan/target_rpm"] == "900"
+
+    @pytest.mark.asyncio
+    async def test_per_device_json_topic(self, monkeypatch):
+        """Full per-unit signals are published as JSON on the bare device topic."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TEPOD--1081100-38-F--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "HVP_PackTempMax": 23.5,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+
+        published = {c.args[0]: c.args[1] for c in pub._client.publish.call_args_list}
+        topic = "pypowerwall/test-gw/devices/TG2312H0001"
+        assert topic in published
+        data = json.loads(published[topic])
+        assert data == {"pack_temp_max": 23.5}
+
+    @pytest.mark.asyncio
+    async def test_no_vitals_no_device_topics(self, monkeypatch):
+        """Without vitals or fan_speeds (e.g. cloud mode) no device topics
+        are published and no device discovery is sent."""
+        pub = self._make_publisher(monkeypatch)
+        await pub.publish_gateway("test-gw", make_status())
+
+        published = {c.args[0] for c in pub._client.publish.call_args_list}
+        assert not [t for t in published if "/devices/" in t]
+
+    @pytest.mark.asyncio
+    async def test_registry_rounding_and_json(self, monkeypatch):
+        """Rounding precision comes from SIGNAL_GROUPS decimals: temperatures
+        1 decimal, rpm whole numbers; the per-unit JSON carries ints for
+        0-decimal metrics and never emits -0.0."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TEPOD--1081100-38-F--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "HVP_PackTempMax": 23.45,
+                    "HVP_PackTempMin": -0.04,
+                },
+                "TEPINV--1707000-21-M--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "PCH_FanSpeed_A": 1397.6,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+
+        published = {c.args[0]: c.args[1] for c in pub._client.publish.call_args_list}
+        prefix = "pypowerwall/test-gw/devices/TG2312H0001"
+        assert published[f"{prefix}/temperature/pack_max"] == "23.4"
+        # -0.04 rounds to -0.0; "+ 0.0" normalizes to 0.0
+        assert published[f"{prefix}/temperature/pack_min"] == "0.0"
+        assert published[f"{prefix}/fan/a/rpm"] == "1398"
+        data = json.loads(published[prefix])
+        assert data["pack_temp_max"] == 23.4
+        assert data["pack_temp_min"] == 0.0
+        assert data["fan_a_rpm"] == 1398
+        assert isinstance(data["fan_a_rpm"], int)  # not 1398.0
+        assert "1398.0" not in published[prefix]
+        assert not str(data["pack_temp_min"]).startswith("-")
+
+    @pytest.mark.asyncio
+    async def test_overflow_value_does_not_stop_publishing(self, monkeypatch):
+        """A single un-floatable value (int too large) must degrade to "no
+        device signals" - battery, online and availability topics still
+        publish on every poll."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TEPOD--1081100-38-F--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "HVP_PackTempMax": 10**400,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+
+        published = {c.args[0] for c in pub._client.publish.call_args_list}
+        assert "pypowerwall/test-gw/battery" in published
+        assert "pypowerwall/test-gw/online" in published
+        assert "pypowerwall/test-gw/availability" in published
+        assert not [t for t in published if "/devices/" in t]
+
+    @pytest.mark.asyncio
+    async def test_extraction_failure_does_not_stop_publishing(
+        self, monkeypatch, caplog
+    ):
+        """If extraction itself raises, the gateway still publishes its base
+        topics with no device topics, discovery isn't re-sent on the next
+        poll, and the failure is logged once at WARNING (with traceback),
+        then at DEBUG until an extraction succeeds again."""
+        import logging
+
+        import app.core.signals as signals_mod
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "mqtt_ha_discovery", True)
+        monkeypatch.setattr(settings, "mqtt_ha_prefix", "homeassistant")
+
+        def boom(vitals, fan_speeds=None):
+            raise KeyError("malformed snapshot")
+
+        monkeypatch.setattr(signals_mod, "extract_unit_signals", boom)
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {"TEPOD--1081100-38-F--TG2312H0001": {"HVP_PackTempMax": 23.5}}
+        )
+        caplog.set_level(logging.DEBUG, logger="app.mqtt.publisher")
+
+        await pub.publish_gateway("test-gw", status)
+        topics = [c.args[0] for c in pub._client.publish.call_args_list]
+        for name in ("battery", "online", "status", "availability"):
+            assert f"pypowerwall/test-gw/{name}" in topics
+        assert not [t for t in topics if "/devices/" in t or "_device_" in t]
+        discovery = [t for t in topics if t.startswith("homeassistant/")]
+        assert discovery  # base entities still discovered
+
+        await pub.publish_gateway("test-gw", status)
+        topics = [c.args[0] for c in pub._client.publish.call_args_list]
+        assert [t for t in topics if t.startswith("homeassistant/")] == discovery
+
+        failures = [
+            r for r in caplog.records if "signal extraction failed" in r.getMessage()
+        ]
+        assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG]
+        assert failures[0].exc_info is not None
+
+        # A successful extraction re-arms the one-time warning
+        monkeypatch.setattr(signals_mod, "extract_unit_signals", lambda v, f=None: {})
+        await pub.publish_gateway("test-gw", status)
+        monkeypatch.setattr(signals_mod, "extract_unit_signals", boom)
+        await pub.publish_gateway("test-gw", status)
+        failures = [
+            r for r in caplog.records if "signal extraction failed" in r.getMessage()
+        ]
+        assert [r.levelno for r in failures][-1] == logging.WARNING
+
+    @pytest.mark.asyncio
+    async def test_device_topics_follow_retain_and_qos(self, monkeypatch):
+        """Per-unit topics use the configured retain flag and QoS like every
+        other state topic."""
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {"TEPOD--1081100-38-F--TG2312H0001": {"HVP_PackTempMax": 23.5}}
+        )
+        await pub.publish_gateway("test-gw", status)
+        device_calls = [
+            c for c in pub._client.publish.call_args_list if "/devices/" in c.args[0]
+        ]
+        assert len(device_calls) == 2  # pack_max topic + per-unit JSON
+        for c in device_calls:
+            assert c.kwargs == {"qos": 1, "retain": True}
+
+    @pytest.mark.asyncio
+    async def test_late_fan_speeds_rediscovery(self, monkeypatch):
+        """A PVAC fan that first appears in fan_speeds on a later poll is
+        discovered then (and only then), through the publisher's own
+        signature handling - not just discovery_signature() in isolation."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "mqtt_ha_discovery", True)
+        monkeypatch.setattr(settings, "mqtt_ha_prefix", "homeassistant")
+        pub = self._make_publisher(monkeypatch)
+
+        def discovery_topics():
+            return [
+                c.args[0]
+                for c in pub._client.publish.call_args_list
+                if c.args[0].startswith("homeassistant/") and "_device_" in c.args[0]
+            ]
+
+        # Poll 1: TETHC vitals only - controller temp discovered
+        status1 = self._make_status_with_vitals(
+            {"TETHC--1081100-08-C--TG123456789": {"THC_AmbientTemp": 21.5}}
+        )
+        await pub.publish_gateway("test-gw", status1)
+        first = discovery_topics()
+        assert first == [
+            "homeassistant/sensor/pypowerwall_test-gw_device_tg123456789_controller_ambient/config"
+        ]
+
+        # Poll 2: the unit's PVAC fan arrives via fan_speeds - the new
+        # metric is discovered, once
+        status2 = self._make_status_with_vitals(
+            {"TETHC--1081100-08-C--TG123456789": {"THC_AmbientTemp": 21.5}},
+            {"PVAC--1081100-38-F--TG123456789": {"PVAC_Fan_Speed_Actual_RPM": 810}},
+        )
+        await pub.publish_gateway("test-gw", status2)
+        second = [t for t in discovery_topics() if t not in first]
+        assert second == [
+            "homeassistant/sensor/pypowerwall_test-gw_device_tg123456789_fan_rpm/config"
+        ]
+
+        # Poll 3: same data again - nothing new is sent
+        await pub.publish_gateway("test-gw", status2)
+        assert [t for t in discovery_topics() if t not in first + second] == []
+
+    @pytest.mark.asyncio
+    async def test_extraction_runs_once_per_poll(self, monkeypatch):
+        """extract_unit_signals runs exactly once per publish_gateway call,
+        shared by the signature, discovery and topic publishing."""
+        import app.core.signals as signals_mod
+
+        calls = []
+        original = signals_mod.extract_unit_signals
+
+        def counting(vitals, fan_speeds=None):
+            calls.append(1)
+            return original(vitals, fan_speeds)
+
+        monkeypatch.setattr(signals_mod, "extract_unit_signals", counting)
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TEPOD--1081100-38-F--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "HVP_PackTempMax": 23.5,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_device_discovery_published_once(self, monkeypatch):
+        """Device-sensor HA discovery fires on the first poll that reports
+        the signals, and not again on the next."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "mqtt_ha_discovery", True)
+        monkeypatch.setattr(settings, "mqtt_ha_prefix", "homeassistant")
+        pub = self._make_publisher(monkeypatch)
+        status = self._make_status_with_vitals(
+            {
+                "TEPOD--1081100-38-F--TG2312H0001": {
+                    "serialNumber": "TG2312H0001",
+                    "HVP_PackTempMax": 23.5,
+                },
+            }
+        )
+        await pub.publish_gateway("test-gw", status)
+        first = [
+            c.args[0]
+            for c in pub._client.publish.call_args_list
+            if c.args[0].startswith("homeassistant/") and "_device_" in c.args[0]
+        ]
+        assert len(first) == 1  # only pack_temp_max reported
+
+        await pub.publish_gateway("test-gw", status)
+        second = [
+            c.args[0]
+            for c in pub._client.publish.call_args_list
+            if c.args[0].startswith("homeassistant/") and "_device_" in c.args[0]
+        ]
+        assert second == first  # no duplicates

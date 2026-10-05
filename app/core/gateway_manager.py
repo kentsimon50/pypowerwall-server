@@ -64,9 +64,10 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -370,10 +371,16 @@ class GatewayManager:
             str, GatewayConfig
         ] = {}  # Gateways waiting for lazy initialization
         self._preserve_stale_count: Dict[str, int] = {}  # Multi-PW snapshot preservation staleness tracker
+
         # Gateways already warned about a requested-vs-active TEDAPI transport
         # mismatch (e.g. bearer requested but hybrid mode speaks basic), so the
         # warning is logged once instead of every poll.
         self._transport_warned: set = set()
+
+        # Gateways whose current vitals were copied from the previous poll by
+        # the multi-PW guard: not fresh readings, so not recorded as history.
+        self._vitals_preserved: Set[str] = set()
+
 
         # TEDAPI SolarOnly fallback tracking (per gateway).
         # Distinct from _consecutive_failures: is_degraded = transient transport
@@ -409,6 +416,10 @@ class GatewayManager:
         # alongside a TEDAPI gateway. This enables hybrid operation:
         # TEDAPI for fast local reads, cloud for control writes.
         self._cloud_control: Optional[pypowerwall.Powerwall] = None
+        # Gateway the shared cloud connection writes for, set only when its
+        # Tesla site is unambiguous (see _cloud_site_unambiguous). MQTT
+        # controls use the shared connection for this gateway and no other.
+        self._cloud_control_gateway_id: Optional[str] = None
 
         # Hybrid cloud-link health (issue #87): the shared cloud connection
         # is a second link with its own failure profile, tracked separately
@@ -474,6 +485,7 @@ class GatewayManager:
         The guard is capped at ``_PRESERVE_STALENESS_CAP`` consecutive polls — after
         that, the partial data passes through so downstream consumers see reality.
         """
+        self._vitals_preserved.discard(gateway_id)
         previous = self._last_successful_data.get(gateway_id)
         if not previous:
             return data
@@ -529,6 +541,7 @@ class GatewayManager:
                 self._PRESERVE_STALENESS_CAP,
             )
             data.vitals = deepcopy(previous.vitals)
+            self._vitals_preserved.add(gateway_id)
             preserved_any = True
 
         if (
@@ -777,6 +790,11 @@ class GatewayManager:
                     "fleetapi": config.fleetapi,
                     "auto_select": True,
                 }
+                if settings.siteid:
+                    # PW_SITEID picks the site on multi-site accounts. The
+                    # cloud client compares it with integer site ids.
+                    siteid = str(settings.siteid).strip()
+                    cloud_kwargs["siteid"] = int(siteid) if siteid.isdigit() else siteid
                 self._cloud_control = await asyncio.wait_for(
                     loop.run_in_executor(
                         self._executor,
@@ -784,6 +802,8 @@ class GatewayManager:
                     ),
                     timeout=15.0,
                 )
+                if await self._cloud_site_unambiguous(config.fleetapi):
+                    self._cloud_control_gateway_id = config.id
                 logger.info(
                     "Cloud control connection established for write operations"
                 )
@@ -792,6 +812,44 @@ class GatewayManager:
                 logger.warning(
                     f"Cloud control connection failed (control will be unavailable): {e}"
                 )
+
+    async def _cloud_site_unambiguous(self, fleetapi: bool) -> bool:
+        """True when the shared cloud connection's Tesla site is certain.
+
+        That is when PW_SITEID is set, a site was chosen with pypowerwall
+        setup (the site file in the auth path), the connection is FleetAPI
+        (its site comes from its own setup), or the account has one site.
+        Otherwise the cloud client defaults to the account's first site,
+        which may not be this gateway's, so MQTT controls don't use it.
+        Only MQTT controls use the binding, so without them nothing is checked.
+        """
+        from app.config import settings
+
+        if not settings.mqtt_controls_available:
+            return False
+        client = getattr(self._cloud_control, "client", None)
+        sitefile = getattr(client, "sitefile", None)
+        if settings.siteid or fleetapi or (sitefile and os.path.exists(sitefile)):
+            return True
+        getsites = getattr(client, "getsites", None)
+        sites = None
+        if getsites is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                sites = await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, getsites), timeout=15.0
+                )
+            except Exception:
+                pass
+        if isinstance(sites, list) and len(sites) == 1:
+            return True
+        logger.warning(
+            "Hybrid cloud connection: the Tesla account has %s sites and no "
+            "site is selected, so MQTT controls won't use it. Set PW_SITEID "
+            "to this gateway's energy site id.",
+            len(sites) if isinstance(sites, list) else "an unknown number of",
+        )
+        return False
 
     async def _cancel_task_with_retry(
         self,
@@ -1679,6 +1737,7 @@ class GatewayManager:
             # Persist the sample for daily energy statistics (never raises;
             # no-op when the store is disabled).
             await self._record_timeseries_sample(gateway_id, gateway, data)
+            await self._record_signal_sample(gateway_id, gateway, data)
 
             # Publish to MQTT after the cache is updated (never raises here).
             self._schedule_mqtt_publish(gateway_id)
@@ -1774,6 +1833,55 @@ class GatewayManager:
             )
         except Exception as e:
             logger.debug(f"Time-series sample recording failed for {gateway_id}: {e}")
+
+    async def _record_signal_sample(
+        self, gateway_id: str, gateway: Gateway, data: PowerwallData
+    ) -> None:
+        """Feed this poll's Powerwall temperatures and fan readings into the
+        TimeSeriesStore.
+
+        Signals come from the vitals and fan_speeds already fetched this
+        cycle (no extra gateway calls). The store keeps at most one snapshot
+        per PW_TIMESERIES_SIGNAL_INTERVAL, so most calls return immediately.
+        Like power samples, failures are logged and swallowed and a hung
+        write is capped by a timeout.
+
+        Args:
+            gateway_id: Gateway identifier.
+            gateway: Gateway config (its timezone keys the daily rollups).
+            data: This poll's data (vitals, fan_speeds, timestamp).
+        """
+        try:
+            from app.core.timeseries import (
+                extract_device_metrics,
+                get_timeseries_store,
+            )
+
+            store = get_timeseries_store()
+            if not store.signals_enabled:
+                return
+            # Vitals copied forward from the previous poll by the multi-PW
+            # guard are not fresh readings: record only this poll's fans
+            vitals = None if gateway_id in self._vitals_preserved else data.vitals
+            metrics = extract_device_metrics(vitals, data.fan_speeds)
+            if not metrics:
+                return
+            ts = data.timestamp
+            if ts is None or ts < 1e9:
+                ts = datetime.now().timestamp()
+            await asyncio.wait_for(
+                store.record_signal_sample(
+                    gateway_id, ts, metrics, timezone=gateway.timezone
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Device signal write timed out for %s — polling continues",
+                gateway_id,
+            )
+        except Exception as e:
+            logger.debug(f"Device signal recording failed for {gateway_id}: {e}")
 
     def _schedule_mqtt_publish(self, gateway_id: str) -> None:
         """Schedule an MQTT publish of the current cached status for a gateway.
@@ -2018,6 +2126,21 @@ class GatewayManager:
                     "TEDAPI probe/recovery task unexpected error for %s: %s",
                     gateway_id, exc,
                 )
+
+    def get_last_data(self, gateway_id: str) -> Optional[PowerwallData]:
+        """Last successfully polled data for a gateway, however old.
+
+        Unlike get_gateway(), this ignores PW_CACHE_TTL, so it suits facts
+        that don't change while the gateway is offline (e.g. which battery
+        is PW1). Read-only: callers must not modify it.
+
+        Args:
+            gateway_id: Gateway identifier
+
+        Returns:
+            The last successful PowerwallData, or None before the first one.
+        """
+        return self._last_successful_data.get(gateway_id)
 
     def get_gateway(self, gateway_id: str) -> Optional[GatewayStatus]:
         """Get status for a specific gateway with graceful degradation support.

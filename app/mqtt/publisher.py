@@ -76,6 +76,23 @@ Topic layout
     {prefix}/{gateway_id}/meters/remote/{din}/ct{n}/energy_exported  int   — Wh, lifetime
     {prefix}/{gateway_id}/meters/remote/{din}/ct{n}                  JSON  — full per-CT data
 
+    Per-unit device signals (Powerwall temperatures and fan speeds, from
+    vitals + get_fan_speeds(), keyed by unit serial):
+    {prefix}/{gateway_id}/devices/{serial}/temperature/pack_max     float — °C (PW3 battery pack)
+    {prefix}/{gateway_id}/devices/{serial}/temperature/pack_min     float — °C (PW3 battery pack)
+    {prefix}/{gateway_id}/devices/{serial}/temperature/shunt        float — °C (PW3 shunt)
+    {prefix}/{gateway_id}/devices/{serial}/temperature/ambient      float — °C (PW3 inverter ambient)
+    {prefix}/{gateway_id}/devices/{serial}/temperature/controller   float — °C (PW2/2+ TETHC ambient)
+    {prefix}/{gateway_id}/devices/{serial}/fan/a/rpm                int   — rpm (PW3 fan A)
+    {prefix}/{gateway_id}/devices/{serial}/fan/a/duty               float — %   (PW3 fan A duty)
+    {prefix}/{gateway_id}/devices/{serial}/fan/b/rpm                int   — rpm (PW3 fan B)
+    {prefix}/{gateway_id}/devices/{serial}/fan/b/duty               float — %   (PW3 fan B duty)
+    {prefix}/{gateway_id}/devices/{serial}/fan/rpm                  int   — rpm (PW2/2+ fan)
+    {prefix}/{gateway_id}/devices/{serial}/fan/target_rpm           int   — rpm (PW2/2+ fan target)
+    {prefix}/{gateway_id}/devices/{serial}                          JSON  — full per-unit signals
+    Only the signals each unit reports are published - a PW2 unit gets fan
+    rpm but no duty, and an expansion pack gets pack temps but no fans.
+
     Remote-meter lifetime energy is converted from Tesla's watt-seconds to
     whole Wh; the per-CT JSON includes Location ("site" / "solar" / "load").
 
@@ -93,6 +110,16 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Control-channel safety limits. Commands act on physical hardware, so the
+# inbound path is bounded: oversized payloads are rejected before parsing
+# (a 1 MB payload must never reach a Tesla write), the broker-side queue is
+# capped, and bursts collapse to latest-wins per control instead of N serial
+# Tesla writes.
+MAX_CONTROL_PAYLOAD_BYTES = 1024
+MAX_QUEUED_CONTROL_MESSAGES = 100
+CONTROL_COALESCE_WINDOW_S = 0.05
+CONTROL_MAX_BATCH = 100
+
 
 class MqttPublisher:
     """Async MQTT publisher with persistent connection and reconnect logic."""
@@ -105,7 +132,14 @@ class MqttPublisher:
         # Per gateway: the optional entities (strings, remote-meter CTs)
         # already announced; a gateway key means base discovery was sent
         self._discovery_sent: Dict[str, frozenset] = {}
+        # Gateways whose per-unit signal extraction last failed: warn once
+        # (with traceback), then log at debug until an extraction succeeds.
+        self._signal_extract_failed: set = set()
+        # Per gateway: last announced control state (see
+        # _control_announce_state); discovery re-fires when it changes
+        self._discovery_controls_state: Dict[str, tuple] = {}
         self._backoff: int = 2           # current reconnect backoff in seconds
+        self._controls_warn_done: bool = False  # half-configured controls warning
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,15 +198,39 @@ class MqttPublisher:
                 pass
         logger.info("MQTT publisher stopped.")
 
-    async def _publish_ha_discovery(self, gateway_id: str, status) -> None:
+    def _control_announce_state(self, gateway_id: str) -> tuple:
+        """(mask, writable, is_v1r): which control entities to announce.
+
+        Uses the same checks as command dispatch, so Home Assistant only
+        shows controls this gateway can actually execute.
+        """
+        from app.config import settings  # late import
+        from app.core.gateway_manager import gateway_manager
+
+        if not settings.mqtt_controls_available:
+            return (0, False, False)
+        return (
+            settings.mqtt_controls,
+            _write_path(gateway_manager, gateway_id) is not None,
+            _gateway_is_v1r(gateway_manager, gateway_id),
+        )
+
+    async def _publish_ha_discovery(
+        self, gateway_id: str, status, device_signals: dict
+    ) -> None:
         """Publish Home Assistant auto-discovery payloads for a gateway.
 
         Called once per gateway on first connection (tracked in _discovery_sent).
         Re-sent after every broker reconnect so HA re-discovers after restarts.
+        Control entities not announced this time (bit off, controls disabled,
+        capability lost) get an empty retained config, so Home Assistant drops
+        them, including ones announced before a restart.
 
         Args:
-            gateway_id: Gateway identifier.
-            status:     GatewayStatus used to extract name and version.
+            gateway_id:     Gateway identifier.
+            status:         GatewayStatus used to extract name and version.
+            device_signals: Per-unit signals from extract_unit_signals(),
+                            computed once per poll by the caller.
         """
         if not self._connected or self._client is None:
             return
@@ -180,6 +238,7 @@ class MqttPublisher:
             from app.config import settings  # late import
             from app.mqtt.ha_discovery import (
                 build_discovery_payloads,
+                control_config_topics,
                 extract_remote_meters,
             )
 
@@ -198,6 +257,8 @@ class MqttPublisher:
                 extract_remote_meters(status.data.vitals) if status.data else {}
             )
 
+            controls_mask, writable, is_v1r = self._control_announce_state(gateway_id)
+
             payloads = build_discovery_payloads(
                 gateway_id=gateway_id,
                 gateway_name=gateway_name,
@@ -206,9 +267,22 @@ class MqttPublisher:
                 version=version,
                 string_ids=string_ids,
                 remote_meters=remote_meters or None,
+                device_signals=device_signals or None,
+                controls=controls_mask,
+                writable=writable,
+                is_v1r=is_v1r,
             )
             for topic, payload in payloads:
                 await self._safe_publish(topic, payload, retain=True, qos=settings.mqtt_qos)
+
+            # Stateless: clear every control entity not announced now. A
+            # topic that holds nothing is a no-op on the broker.
+            announced = {topic for topic, _ in payloads}
+            for topic in control_config_topics(gateway_id, settings.mqtt_ha_prefix):
+                if topic not in announced:
+                    await self._safe_publish(
+                        topic, "", retain=True, qos=settings.mqtt_qos
+                    )
 
             logger.info(
                 f"MQTT HA discovery published for gateway '{gateway_id}' "
@@ -231,22 +305,54 @@ class MqttPublisher:
             return
 
         # Send HA discovery payloads the first time we see this gateway, and
-        # again whenever a snapshot reports strings or remote-meter CTs not
-        # announced yet (re-sent after reconnect too: _discovery_sent is
-        # cleared there). Storing the union means a later snapshot without
-        # them (e.g. a vitals timeout) doesn't re-send.
-        from app.mqtt.ha_discovery import discovery_signature
+        # again whenever a snapshot reports strings, remote-meter CTs or
+        # per-unit device signals not announced yet (re-sent after reconnect
+        # too: _discovery_sent is cleared there). Storing the union means a
+        # later snapshot without them (e.g. a vitals timeout) doesn't re-send.
+        from app.core.signals import (
+            SIGNAL_GROUPS,
+            SIGNAL_METRICS,
+            extract_unit_signals,
+        )
+        from app.mqtt.ha_discovery import DEVICE_METRIC_TOPICS, discovery_signature
 
         data = status.data if status else None
+        # Extract per-unit signals once per poll; discovery signature, HA
+        # discovery and the per-unit topics below all reuse this result.
+        # Guarded: a malformed snapshot must degrade to "no device signals",
+        # never to an exception that would stop the whole gateway's MQTT.
+        device_signals: dict = {}
+        if data:
+            try:
+                device_signals = extract_unit_signals(data.vitals, data.fan_speeds)
+                self._signal_extract_failed.discard(gateway_id)
+            except Exception:
+                first = gateway_id not in self._signal_extract_failed
+                self._signal_extract_failed.add(gateway_id)
+                logger.log(
+                    logging.WARNING if first else logging.DEBUG,
+                    "Per-unit signal extraction failed for gateway '%s'",
+                    gateway_id,
+                    exc_info=True,
+                )
+        controls_state = self._control_announce_state(gateway_id)
         signature = discovery_signature(
-            data.strings if data else None, data.vitals if data else None
+            data.strings if data else None,
+            data.vitals if data else None,
+            device_signals,
         )
         announced = self._discovery_sent.get(gateway_id)
-        if announced is None or not signature <= announced:
+        last_controls = self._discovery_controls_state.get(gateway_id)
+        if (
+            announced is None
+            or not signature <= announced
+            or last_controls != controls_state
+        ):
             from app.config import settings  # late import
             if settings.mqtt_ha_discovery:
-                await self._publish_ha_discovery(gateway_id, status)
+                await self._publish_ha_discovery(gateway_id, status, device_signals)
             self._discovery_sent[gateway_id] = (announced or frozenset()) | signature
+            self._discovery_controls_state[gateway_id] = controls_state
 
         try:
             from app.config import settings  # late import
@@ -535,6 +641,41 @@ class MqttPublisher:
                                 ct_prefix, json.dumps(fields), retain, qos
                             )
 
+                # Per-unit device signal topics (Powerwall temperatures
+                # and fan speeds, keyed by unit serial — the same units as
+                # the web console's Powerwall Status table). Uses the
+                # signals extracted once per poll above.
+                for serial, signals in device_signals.items():
+                    device_prefix = f"{prefix}/devices/{serial}"
+                    rounded: dict = {}
+                    for metric_id, value in signals.items():
+                        entry = DEVICE_METRIC_TOPICS.get(metric_id)
+                        if entry is None:
+                            continue
+                        topic_suffix = entry[0]
+                        # Precision comes from the registry (SIGNAL_GROUPS
+                        # decimals), one rounding for both the topic text
+                        # and the per-unit JSON below; "+ 0.0" keeps -0.04
+                        # from publishing as "-0.0". Whole numbers (d == 0)
+                        # go into the JSON as ints.
+                        decimals = SIGNAL_GROUPS[SIGNAL_METRICS[metric_id]["group"]][
+                            "decimals"
+                        ]
+                        rounded_value = round(value, decimals) + 0.0
+                        rounded[metric_id] = (
+                            int(rounded_value) if decimals == 0 else rounded_value
+                        )
+                        await self._safe_publish(
+                            f"{device_prefix}/{topic_suffix}",
+                            f"{rounded_value:.{decimals}f}",
+                            retain,
+                            qos,
+                        )
+                    # Full per-unit JSON for consumers that want everything
+                    await self._safe_publish(
+                        device_prefix, json.dumps(rounded), retain, qos
+                    )
+
                 # Summary JSON topic
                 summary = {
                     "online": status.online,
@@ -649,6 +790,9 @@ class MqttPublisher:
                     identifier=settings.mqtt_client_id,
                     will=will,
                     tls_context=tls_context,
+                    # Bound the inbound queue: command bursts must not grow
+                    # memory without limit (latest-wins collapses them anyway).
+                    max_queued_incoming_messages=MAX_QUEUED_CONTROL_MESSAGES,
                 )
 
                 logger.info(
@@ -661,6 +805,7 @@ class MqttPublisher:
                     self._backoff = 2  # reset on successful connect
                     # Clear discovery set so HA payloads are re-sent after reconnect
                     self._discovery_sent.clear()
+                    self._discovery_controls_state.clear()
                     logger.info(
                         f"MQTT connected to {settings.mqtt_host}:{settings.mqtt_port}"
                     )
@@ -676,12 +821,86 @@ class MqttPublisher:
                         retain=True, qos=settings.mqtt_qos,
                     )
 
+                    # Subscribe to control command topics if controls are enabled (broker-trust, no token in payload).
+                    # Topic pattern: {prefix}/{gateway_id}/control/{control}/set  e.g. pypowerwall/home/control/reserve/set
+                    control_task = None
+                    if settings.mqtt_controls_available:
+                        control_topic = f"{settings.mqtt_topic_prefix}/+/control/+/set"
+                        try:
+                            granted = await client.subscribe(control_topic, qos=1)
+                        except Exception as e:
+                            # Transient: reconnect after the backoff, which
+                            # subscribes again, instead of running without controls
+                            raise RuntimeError(f"control subscribe failed: {e}") from e
+                        if any(getattr(c, "value", c) >= 0x80 for c in granted or ()):
+                            # Refused by the broker (e.g. its ACL): a retry
+                            # can't help, so say so and keep monitoring
+                            logger.error(
+                                "MQTT broker refused the subscription to %s, so "
+                                "controls are off: allow this user to read it in "
+                                "the broker ACL",
+                                control_topic,
+                            )
+                        else:
+                            logger.info(
+                                "MQTT controls subscribed to %s (enabled: %s)",
+                                control_topic,
+                                ", ".join(settings.mqtt_control_names()),
+                            )
+                            if settings.mqtt_control_allowed("islanding"):
+                                logger.warning(
+                                    "MQTT ISLANDING control is enabled: broker "
+                                    "clients can open the grid contactor. "
+                                    "Restrict broker access and ACL %s/+/control/#",
+                                    settings.mqtt_topic_prefix,
+                                )
+                            control_task = asyncio.create_task(
+                                self._control_message_loop(client),
+                                name="mqtt-control-handler",
+                            )
+                    elif settings.mqtt_controls and not self._controls_warn_done:
+                        # Controls requested but a prerequisite is missing:
+                        # they stay off (fail closed). Say which, once.
+                        self._controls_warn_done = True
+                        missing = [
+                            name
+                            for name, value in (
+                                ("MQTT_USERNAME", settings.mqtt_username),
+                                ("MQTT_PASSWORD", settings.mqtt_password),
+                                ("PW_CONTROL_SECRET", settings.control_secret),
+                            )
+                            if not value
+                        ]
+                        logger.warning(
+                            "MQTT controls requested (MQTT_CONTROLS=%s) but "
+                            "disabled: set %s",
+                            settings.mqtt_controls,
+                            ", ".join(missing),
+                        )
+
                     # Inner heartbeat loop: stays alive until a publish failure
                     # sets _connected=False, or until shutdown is requested.
                     # The 5-second sleep matches the default poll interval so we
-                    # detect disconnect promptly without busy-waiting.
-                    while self._connected and not self._shutdown:
-                        await asyncio.sleep(5)
+                    # detect disconnect promptly without busy-waiting. It also
+                    # watches the control handler: if that task died silently,
+                    # reconnect (which recreates it) instead of losing commands.
+                    try:
+                        while self._connected and not self._shutdown:
+                            if control_task is not None and control_task.done():
+                                logger.warning(
+                                    "MQTT control handler ended unexpectedly — "
+                                    "reconnecting..."
+                                )
+                                self._connected = False
+                                break
+                            await asyncio.sleep(5)
+                    finally:
+                        if control_task and not control_task.done():
+                            control_task.cancel()
+                            try:
+                                await control_task
+                            except asyncio.CancelledError:
+                                pass
 
                     # If we exited the inner loop due to a publish failure
                     # (not shutdown), let the context manager close cleanly then
@@ -707,6 +926,286 @@ class MqttPublisher:
 
         self._connected = False
         self._client = None
+
+    async def _control_message_loop(self, client) -> None:
+        """Run control commands from ``{prefix}/+/control/+/set``.
+
+        Trust comes from broker authentication and its topic ACL;
+        ``PW_CONTROL_SECRET`` is never read from a payload. A burst collapses
+        to the latest command per topic, and each command runs on exactly one
+        connection (no retry), like the HTTP ``POST /control/*`` routes. If
+        the loop ends while we are running, force a reconnect, which restarts
+        it.
+        """
+        try:
+            messages = client.messages.__aiter__()
+            while not self._shutdown:
+                first = await messages.__anext__()
+                batch = await self._collect_control_burst(messages, first)
+                for topic, payload, retained in self._latest_commands(batch):
+                    if retained:
+                        logger.warning(
+                            f"MQTT control command on {topic!r} ignored: "
+                            "retained commands are not executed "
+                            "(publish with retain=false)"
+                        )
+                    else:
+                        await self._handle_control_message(topic, payload)
+                    # Delete any retained copy, whatever the sender did, so a
+                    # stored command can never run again on a reconnect.
+                    await self._clear_command(client, topic)
+        except asyncio.CancelledError:
+            raise
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            logger.warning(f"MQTT control message loop error: {e}")
+        if not self._shutdown:
+            logger.warning("MQTT control message loop ended, forcing reconnect")
+            self._connected = False
+
+    async def _collect_control_burst(self, messages, first) -> list:
+        """The first message plus any that arrive within the coalesce window.
+
+        Never cancel ``__anext__()``: a cancelled call can lose a message it
+        already took from aiomqtt's queue. Wait out the window, then take only
+        what is already queued.
+        """
+        batch = [first]
+        await asyncio.sleep(CONTROL_COALESCE_WINDOW_S)
+        while len(messages) and len(batch) < CONTROL_MAX_BATCH:
+            batch.append(await messages.__anext__())
+        return batch
+
+    @staticmethod
+    def _latest_commands(batch) -> list:
+        """[(topic, payload, retained)] with the latest message per topic.
+
+        Empty payloads are dropped: that is how a retained topic is cleared,
+        including the echo of our own clear.
+        """
+        latest: dict = {}
+        for message in batch:
+            topic = str(message.topic)
+            payload = message.payload
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8")
+            if not payload:
+                logger.debug(f"MQTT control: empty payload on {topic!r} ignored")
+                continue
+            latest.pop(topic, None)  # keep the order of the latest messages
+            latest[topic] = (bytes(payload), bool(message.retain))
+        return [(topic, p, r) for topic, (p, r) in latest.items()]
+
+    @staticmethod
+    async def _clear_command(client, topic: str) -> None:
+        """Delete a retained command (no-op when nothing is retained)."""
+        try:
+            await client.publish(topic, b"", qos=1, retain=True)
+        except Exception as e:
+            logger.debug(f"MQTT control: clearing {topic!r} failed: {e}")
+
+    async def _handle_control_message(self, topic: str, payload_bytes: bytes) -> None:
+        """Validate one control command and run it. Never raises."""
+        try:
+            from app.config import MQTT_CONTROL_BITS
+            from app.config import settings as _settings
+            from app.core.gateway_manager import gateway_manager
+
+            # {prefix}/{gateway}/control/{name}/set; the prefix may have levels
+            prefix = f"{_settings.mqtt_topic_prefix}/"
+            parts = topic[len(prefix):].split("/") if topic.startswith(prefix) else []
+            if len(parts) != 4 or parts[1] != "control" or parts[3] != "set":
+                logger.warning(f"MQTT control: malformed topic {topic!r}")
+                return
+            gateway_id, control = parts[0], parts[2]
+            label = f"MQTT control {control!r} for {gateway_id!r}"
+            if gateway_id not in gateway_manager.gateways:
+                logger.warning(f"{label} rejected: unknown gateway")
+                return
+            if control not in MQTT_CONTROL_BITS:
+                logger.warning(f"{label} rejected: unknown control")
+                return
+            if not _settings.mqtt_control_allowed(control):
+                logger.warning(f"{label} rejected: MQTT_CONTROLS bit not set")
+                return
+            if len(payload_bytes) > MAX_CONTROL_PAYLOAD_BYTES:
+                logger.warning(
+                    f"{label} rejected: payload of {len(payload_bytes)} bytes "
+                    f"exceeds the {MAX_CONTROL_PAYLOAD_BYTES} byte cap"
+                )
+                return
+            try:
+                payload = json.loads(payload_bytes.decode("utf-8"))
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                logger.warning(f"{label} rejected: payload is not a JSON object")
+                return
+
+            if control == "islanding":
+                action = payload.get("action")
+                confirm = payload.get("confirm")
+                if action not in ("off_grid", "on_grid") or confirm is not True:
+                    logger.warning(
+                        f"{label} rejected: need action off_grid/on_grid "
+                        "with confirm:true"
+                    )
+                    return
+                if not _gateway_is_v1r(gateway_manager, gateway_id):
+                    logger.warning(f"{label} rejected: no confirmed v1r transport")
+                    return
+                method = "go_off_grid" if action == "off_grid" else "reconnect_grid"
+                kwargs = {"confirm": True} if action == "off_grid" else {}
+                try:
+                    # Local v1r only, never the shared cloud connection, same
+                    # 10 s timeout as HTTP, never retried
+                    result = await gateway_manager.local_control(
+                        gateway_id, method, timeout=10.0, **kwargs
+                    )
+                except Exception as e:  # cooldown or a command in progress
+                    logger.warning(f"{label} action={action} failed: {e}")
+                    return
+                audit = f"action={action} via local v1r"
+                ok = _island_ack_ok(result)
+            else:
+                value = payload.get("value")
+                if not _CONTROL_VALUE_OK[control](value):
+                    hint = _CONTROL_VALUE_HINT[control]
+                    if (
+                        control == "reserve"
+                        and isinstance(value, float)
+                        and value.is_integer()
+                        and 0 <= value <= 100
+                    ):
+                        # 40.0 reads as 40: name the decimal point as the problem
+                        reason = (
+                            f"{value!r} has a decimal point, send {int(value)} ({hint})"
+                        )
+                    else:
+                        reason = f"invalid value {_short(value)} (must be {hint})"
+                    logger.warning(f"{label} rejected: {reason}")
+                    return
+                path = _write_path(gateway_manager, gateway_id)
+                if path is None:
+                    logger.warning(
+                        f"{label} rejected: this gateway can't write it (needs "
+                        "cloud, FleetAPI, hybrid cloud or v1r)"
+                    )
+                    return
+                method = _CONTROL_METHODS[control]
+                if path == "hybrid cloud":
+                    result = await gateway_manager.cloud_control(
+                        method, value, timeout=10.0
+                    )
+                else:
+                    result = await gateway_manager.local_control(
+                        gateway_id, method, value, timeout=10.0
+                    )
+                audit = f"value={value!r} via {path}"
+                ok = result is not None and not _is_error_result(result)
+
+            if ok:
+                logger.info(f"{label} applied ({audit})")
+            else:
+                logger.warning(
+                    f"{label} failed ({audit}): {_short(result)}; check the "
+                    "gateway state"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"MQTT control handler error for {topic!r}: {e}")
+
+
+# Value checks and library setters for the value controls (same rules as the
+# HTTP POST /control/* routes). bool is an int subclass, so reserve rejects it.
+_CONTROL_VALUE_OK = {
+    "reserve": lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100
+    ),
+    "mode": lambda v: v in ("self_consumption", "backup", "autonomous"),
+    "grid_charging": lambda v: isinstance(v, bool),
+    "grid_export": lambda v: v in ("battery_ok", "pv_only", "never"),
+}
+_CONTROL_VALUE_HINT = {
+    "reserve": "a whole number from 0 to 100",
+    "mode": "self_consumption, backup or autonomous",
+    "grid_charging": "true or false",
+    "grid_export": "battery_ok, pv_only or never",
+}
+_CONTROL_METHODS = {
+    "reserve": "set_reserve",
+    "mode": "set_mode",
+    "grid_charging": "set_grid_charging",
+    "grid_export": "set_grid_export",
+}
+
+
+def _short(val: object, limit: int = 200) -> str:
+    """repr() for log lines, truncated: received values can hold newlines."""
+    text = repr(val)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _is_error_result(result: object) -> bool:
+    """True when a library response reports an error instead of a value."""
+    return isinstance(result, dict) and ("error" in result or "ERROR" in result)
+
+
+def _island_ack_ok(result: object) -> bool:
+    """Hardware acknowledgement, same rule as HTTP POST /control/islanding.
+
+    Only ``{"result": 1}`` counts (an int, not True).
+    """
+    if not isinstance(result, dict) or _is_error_result(result):
+        return False
+    ack = result.get("result")
+    return isinstance(ack, int) and not isinstance(ack, bool) and ack == 1
+
+
+def _write_path(gateway_manager, gateway_id: str) -> Optional[str]:
+    """The connection that writes reserve, mode and grid settings, or None.
+
+    pypowerwall can only write these over cloud, FleetAPI or v1r (on TEDAPI
+    full and plain local they log an ERROR and return None). The shared
+    hybrid cloud connection only counts for the gateway it is bound to.
+    Discovery and dispatch both use this, so Home Assistant only shows
+    controls the gateway can run.
+    """
+    gw = gateway_manager.gateways.get(gateway_id)
+    if gw is None:
+        return None
+    if gw.fleetapi:
+        return "fleetapi"
+    if gw.cloud_mode:
+        return "cloud"
+    if (
+        gateway_manager._cloud_control is not None
+        and gateway_manager._cloud_control_gateway_id == gateway_id
+    ):
+        return "hybrid cloud"
+    if _gateway_is_v1r(gateway_manager, gateway_id):
+        return "local v1r"
+    return None
+
+
+def _gateway_is_v1r(gateway_manager, gateway_id: str) -> bool:
+    """True when the gateway is confirmed on the v1r transport (PW2 and PW3).
+
+    Fails closed like the Console: an unknown mode (cold start, cloud
+    failover) is not v1r.
+    """
+    try:
+        from app.mqtt.ha_discovery import is_v1r_gateway
+
+        status = gateway_manager.get_gateway(gateway_id)
+        return is_v1r_gateway(
+            gateway_manager.gateways.get(gateway_id),
+            status.data if status else None,
+        )
+    except Exception:
+        return False
 
 
 def _safe_float(val) -> Optional[float]:

@@ -237,3 +237,6 @@ data/
 /IDENTITY.md
 /HEARTBEAT.md
 /.openclaw/
+pws-data/timeseries.db
+pws-data/timeseries.db
+docker-compose.yml
