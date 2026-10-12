@@ -425,7 +425,7 @@ async def favicon_ico():
 
 
 @app.get("/", response_class=HTMLResponse, tags=["UI"])
-async def root(request: Request, style: str = None):
+async def root(style: str = None):
     """Serve the Power Flow animation (Tesla Powerwall interface).
 
     Args:
@@ -472,31 +472,16 @@ async def root(request: Request, style: str = None):
         content = content.replace("{EMAIL}", "")
         content = content.replace("{THEME_CLASS}", f"pypowerwall-theme-{style_name}")
 
-        # Build absolute API base URL from request.
-        # When behind an HTTPS reverse proxy (e.g. nginx), the backend sees
-        # requests as plain HTTP.  Honour X-Forwarded-Proto / X-Forwarded-Host
-        # so the injected {API_BASE_URL} uses the correct scheme, avoiding
-        # Mixed Content errors in the browser.
-        #
-        # nginx's $host variable strips the port; $http_host preserves it.
-        # If nginx sends X-Forwarded-Host without a port (common with $host),
-        # check X-Forwarded-Port and re-attach the port so the powerflow app.js
-        # calls back through the same proxy rather than the bare origin port.
-        scheme = (
-            request.headers.get("x-forwarded-proto")
-            or request.url.scheme
-        )
-        host = (
-            request.headers.get("x-forwarded-host")
-            or request.url.netloc
-        )
-        # Re-attach non-standard port when X-Forwarded-Host was set without one
-        fwd_port = request.headers.get("x-forwarded-port")
-        if fwd_port and ":" not in host:
-            standard = ("443" if scheme == "https" else "80")
-            if fwd_port != standard:
-                host = f"{host}:{fwd_port}"
-        api_base_url = f"{scheme}://{host}{_proxy_base}/api"
+        # API base URL for the powerflow bundle, as a path relative to the
+        # page's own origin.  app.js only concatenates endpoint paths onto
+        # window.apiBaseUrl (fetch(uri + "/meters/aggregates")), so a relative
+        # base inherits whatever scheme, host and port the browser used to
+        # load the page.  An absolute URL built from X-Forwarded-Proto broke
+        # whenever TLS terminated upstream of a proxy that rewrote the header
+        # (e.g. Cloudflare -> nginx with `X-Forwarded-Proto $scheme`): the
+        # page was HTTPS, the injected base was http://, and every data call
+        # was blocked as mixed content.
+        api_base_url = f"{_proxy_base}/api"
 
         # Set up asset prefix for static files - needs trailing slash for webpack chunk loading.
         # Prepend proxy base so webpack public path (s.p = window.appPrefix) resolves chunks

@@ -1864,6 +1864,22 @@
                         <div class="health-label">Server Uptime</div>
                         <div class="health-value" id="server-uptime">--</div>
                     </div>
+                    <div class="health-item" id="gateway-uptime-item" style="display:none">
+                        <div class="health-label">Gateway Uptime</div>
+                        <div class="health-value" id="gateway-uptime">--</div>
+                    </div>
+                    <div class="health-item" id="installed-item" style="display:none">
+                        <div class="health-label">Installed</div>
+                        <div class="health-value" id="installed-date" style="white-space:nowrap">--</div>
+                    </div>
+                    <div class="health-item" id="commissioned-item" style="display:none">
+                        <div class="health-label">Commissioned</div>
+                        <div class="health-value" id="commissioned-date" style="white-space:nowrap">--</div>
+                    </div>
+                    <div class="health-item" id="restarted-item" style="display:none">
+                        <div class="health-label">Restarted</div>
+                        <div class="health-value" id="restarted-date" style="white-space:nowrap">--</div>
+                    </div>
                     <div class="health-item">
                         <div class="health-label">Requests</div>
                         <div class="health-value" id="server-calls">--</div>
@@ -2164,6 +2180,7 @@
         const maxReconnectAttempts = 10;
         const reconnectDelay = 3000;
         let lastUpdateTime = null;
+        let reconnectTimer = null;
         
         // Trend chart data (in-memory only, cleared on refresh)
         const trendData = {
@@ -2248,6 +2265,7 @@
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws/aggregate`;
             
+            dropWebSocket();
             ws = new WebSocket(wsUrl);
             
             ws.onopen = () => {
@@ -2268,7 +2286,8 @@
             ws.onclose = () => {
                 console.log('WebSocket disconnected, reconnecting...');
                 updateBannerStatus(false);
-                setTimeout(connectWebSocket, 3000);
+                clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
             };
         }
         
@@ -2282,7 +2301,53 @@
                 banner.classList.add('disconnected');
             }
         }
+
+        // Close the current socket for good. Its handlers go first: a socket
+        // closed on pagehide can deliver its close event after a Back-Forward
+        // Cache restore, and must not turn the banner red or reconnect then.
+        function dropWebSocket() {
+            clearTimeout(reconnectTimer);
+            if (!ws) return;
+            ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+            try { ws.close(); } catch (e) {}
+            ws = null;
+        }
+
+        // Back-Forward Cache: the browser kills the socket on hide, which
+        // would show red on return. Close it quietly instead and reconnect
+        // right away when the page is restored (green, like a fresh load).
+        window.addEventListener('pagehide', dropWebSocket);
+        window.addEventListener('pageshow', (event) => {
+            if (!event.persisted) return;
+            updateBannerStatus(true);
+            connectWebSocket();
+        });
         
+        // Go duration ("398h29m44.192s", as /api/status reports up_time_seconds)
+        // to seconds, or null for anything else (including null)
+        function parseGoDuration(text) {
+            if (typeof text !== 'string' || !text) return null;
+            const m = text.match(/^(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+(?:\.\d+)?)s)?$/);
+            if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined)) return null;
+            return Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
+        }
+
+        // "2025-12-15T15:48:57-08:00" or "2026-09-24 21:28:16 -0700" -> the date part
+        // (the site's local date), or null
+        function isoDate(text) {
+            const m = typeof text === 'string' ? text.match(/^(\d{4}-\d{2}-\d{2})/) : null;
+            return m ? m[1] : null;
+        }
+
+        // Seconds in the "16 days, 18:42:33" style Server Uptime uses
+        function formatTimedelta(totalSeconds) {
+            const secs = Math.floor(totalSeconds);
+            const days = Math.floor(secs / 86400);
+            const rest = secs % 86400;
+            const hms = `${Math.floor(rest / 3600)}:${String(Math.floor(rest % 3600 / 60)).padStart(2, '0')}:${String(rest % 60).padStart(2, '0')}`;
+            return days ? `${days} day${days === 1 ? '' : 's'}, ${hms}` : hms;
+        }
+
         function formatPower(watts) {
             const kw = watts / 1000;
             return kw.toFixed(2);
@@ -2902,6 +2967,30 @@
                     }
                 } catch (e) {
                     console.log('Firmware version not available:', e.message);
+                }
+
+                // Gateway uptime, and the Installed (cloud/FleetAPI), Commissioned
+                // (TEDAPI) and Restarted (TEDAPI with a Backup Gateway) dates, date
+                // only, from /api/status; each shown only when reported
+                try {
+                    const sResponse = await fetch('/api/status');
+                    if (sResponse.ok) {
+                        const sData = await sResponse.json();
+                        for (const [key, id] of [['installation_date', 'installed'],
+                                                 ['battery_commission_date', 'commissioned'],
+                                                 ['start_time', 'restarted']]) {
+                            const date = isoDate(sData[key]);
+                            document.getElementById(`${id}-date`).textContent = date || '--';
+                            document.getElementById(`${id}-item`).style.display = date ? '' : 'none';
+                        }
+                        document.getElementById('restarted-item').title = sData.start_time || '';
+                        // Gateway uptime, shown only when reported
+                        const upSecs = parseGoDuration(sData.up_time_seconds);
+                        document.getElementById('gateway-uptime').textContent = upSecs !== null ? formatTimedelta(upSecs) : '--';
+                        document.getElementById('gateway-uptime-item').style.display = upSecs !== null ? '' : 'none';
+                    }
+                } catch (e) {
+                    console.log('Gateway dates not available:', e.message);
                 }
             } catch (e) {
                 controlIslandingAvailable = false;

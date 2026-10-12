@@ -2,6 +2,37 @@
 
 ## Version History
 
+### [0.10.0] - 2026-10-11
+
+**Added:**
+- **Reserve hold (`reserve_hold`) — set backup reserve to the current SoC without a prior read:** `POST /control/reserve_hold` with `{}` (authenticated like the other control routes, default gateway like `reserve`) reads the SoC from a live poll and calls `set_reserve()` with the value rounded down; unknown or stale SoC fails closed with 503 (never 0). MQTT: `pypowerwall/{gw}/control/reserve_hold/set` with `{}` plus a Home Assistant `Hold Battery` button — shares Bit `1` with reserve, so anyone with that bit gets the new button on upgrade and `31` still means all. To release a hold, set the reserve back with `POST /control/reserve` or the Backup Reserve number. Tesla caps the backup reserve at 80%, so a hold above 80% charge sets 80%.
+- **MQTT: per-battery capacity and charge** — each battery block now publishes `{prefix}/{gw}/batteries/{n}/capacity` and `{prefix}/{gw}/batteries/{n}/charge` (Wh) plus a `{prefix}/{gw}/batteries` JSON summary, with matching Home Assistant sensors, so individual battery degradation can be tracked instead of just the site aggregate. Battery numbering follows the gateway's block order and survives a block temporarily going silent, and only measurements the gateway actually reports are announced. (#150)
+- **Gateway uptime and Installed, Commissioned and Restarted dates on the Console** — the System Health card shows the gateway's uptime next to the server's, and when the system was installed (cloud/FleetAPI), the batteries commissioned (TEDAPI) and the gateway last restarted (TEDAPI with a Backup Gateway), as plain dates (hover over Restarted for the exact time). Each appears only when the gateway reports it. `/api/status` passes through the library's `battery_commission_date` / `installation_date`.
+
+**Fixed:**
+- **`/api/site_info` returns real values** — it was built from `/api/system_status` keys that don't exist there, so energy/power ratings, meter limits, panel current and the grid code were always `null`, and the timezone came from the server's settings. It now returns pypowerwall's `/api/site_info` (the gateway's own response, or built from its config), refreshed every 5 minutes, falling back to the old response when that isn't available.
+
+**Changed:**
+- **pypowerwall upgraded to 0.20.0** (from 0.19.0; `requirements.txt` pin and `pyproject.toml` minimum). Library changes that reach server users:
+  - Powerwall 3 battery health in vitals: lifetime kWh discharged, capacity average, cycle counters, and rapid-shutdown and battery-aggregate detail (jasonacox/pypowerwall#421).
+  - `/api/status` `start_time` and `up_time_seconds` now say when the gateway last started (TEDAPI sites with a Backup Gateway), or `null` where that isn't known; `git_hash` is filled (jasonacox/pypowerwall#419).
+  - TEDAPI `/api/site_info` is filled (jasonacox/pypowerwall#420), and `/vitals` PVAC blocks no longer pick up `PVS_String*_Connected` after a `/strings` call (jasonacox/pypowerwall#414).
+  - Interactive Tesla login and Fleet API setup no longer print tokens to the console (jasonacox/pypowerwall#417).
+
+### [0.9.1] - 2026-10-10
+
+**Fixed:**
+- **Power Flow works behind HTTPS proxies that rewrite forwarded headers** — the Power Flow page built its API address from the `X-Forwarded-*` headers. Behind Cloudflare Tunnel or Zero Trust in front of nginx (`X-Forwarded-Proto $scheme`), an `https://` page got an `http://` address, the browser blocked every data call and the animation stayed blank. The address is now a path (`/api`, or `{PROXY_BASE_URL}/api`), so the browser uses the same scheme, host and port it loaded the page with, as the pypowerwall proxy does. Existing proxy setups keep working. Thanks @Nexarian (#140)
+- **Console status no longer flashes red when you come back from the API docs** — going Back restored the page as you left it, including the live connection the browser had closed, so the status banner showed disconnected until it reconnected. The Console now closes that connection quietly when you leave and reconnects as soon as you return; a real disconnect still shows red. Thanks @erikgieseler (#142)
+
+**Changed:**
+- **pypowerwall upgraded to 0.19.0** (from 0.18.2; `requirements.txt` pin and `pyproject.toml` minimum). Docker images now ship pypowerwall 0.19.0. The server uses only the library's public API and keeps its default `failover=True`, so behavior changes only where the library fixed something. Library changes that reach server users:
+  - Wi-Fi Tesla Remote Meter (`trm_wifi`) sites are recognized, and `/api/meters/aggregates` holds the last solar reading through short `SolarMeterComms` dropouts instead of dropping solar to 0 (jasonacox/pypowerwall#400).
+  - A poll no longer fails when the gateway reports a voltage but no power for a location, or returns config with `meters`/`vin` null right after a restart. A failed poll looked like a dead link and triggered reconnects (jasonacox/pypowerwall#400, jasonacox/pypowerwall#412).
+  - v1r with a WiFi fallback host: after the LAN recovers, the gateway's native API (lifetime energy counters) goes back to the LAN instead of staying on WiFi (jasonacox/pypowerwall#401).
+  - Solar-only gateways: `get_reserve()` returns no value instead of raising, so the poll still collects time remaining (jasonacox/pypowerwall#406).
+  - The library's protobufs are namespaced, so it can be imported in the same Python process as other Tesla protobuf libraries such as Home Assistant's Teslemetry integration (jasonacox/pypowerwall#410).
+
 ### [0.9.0] - 2026-10-04
 
 **Added:**
