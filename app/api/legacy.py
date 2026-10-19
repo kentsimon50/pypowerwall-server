@@ -64,7 +64,7 @@ from typing import Any, Dict, Optional
 import psutil
 import pypowerwall
 from pypowerwall import parse_version
-from fastapi import APIRouter, HTTPException, Response, Header
+from fastapi import APIRouter, HTTPException, Response, Query, Header
 
 from app.api.auth import verify_control_token
 from app.mqtt.publisher import is_error_result
