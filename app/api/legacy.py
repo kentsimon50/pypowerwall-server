@@ -63,9 +63,11 @@ from typing import Any, Dict, Optional
 
 import psutil
 import pypowerwall
-from fastapi import APIRouter, HTTPException, Response, Header, Query
+from pypowerwall import parse_version
+from fastapi import APIRouter, HTTPException, Response, Header
 
 from app.api.auth import verify_control_token
+from app.mqtt.publisher import is_error_result
 from app.core.gateway_manager import (
     IslandingCommandInProgressError,
     IslandingCooldownError,
@@ -283,9 +285,13 @@ async def control_api(
 ):
     """Authenticated control endpoint for POST operations.
 
-    Routes to cloud control connection for write operations (set_reserve, set_mode,
-    set_grid_charging) when available, since TEDAPI doesn't support POST/write APIs.
-    Falls back to direct post for cloud-mode or FleetAPI gateways.
+    Write priority is shared with the MQTT controls
+    (gateway_manager.control_write): write operations (set_reserve,
+    set_mode, set_grid_charging, set_grid_export) go to the hybrid cloud
+    connection when one is configured, else the gateway's own local connection
+    — unless PW_LOCAL_FIRST is set, which tries a confirmed v1r transport
+    first while its LAN is up and a local connection exists. Unmapped paths
+    fall back to a direct post for cloud-mode or FleetAPI gateways.
 
     Optional companion parameters (ported from pypowerwall PR #308):
     - POST /control/reserve with mode=<mode> calls set_operation(level, mode)
@@ -356,24 +362,31 @@ async def control_api(
                        + ", ".join(valid_modes),
             )
         level = data["value"]
-        if gateway_manager._cloud_control:
-            result = await gateway_manager.cloud_control(
-                "set_operation", level, mode_val, timeout=10.0
-            )
-            if result is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Control operation failed via cloud",
-                )
-            return result
-        # Fallback for local gateways (v1r / Basic LAN): use the library's
-        # set_operation() on the gateway's own local connection so the write
-        # is translated correctly instead of a raw POST the gateway rejects.
         gateway_id = get_default_gateway()
-        result = await gateway_manager.local_control(
+        # PW_LOCAL_FIRST: try a confirmed local v1r transport first. When
+        # the helper declines (flag off, non-v1r, LAN down or no local
+        # connection), the historical dispatch below runs verbatim.
+        path_label, result = await gateway_manager.control_write(
             gateway_id, "set_operation", level, mode_val, timeout=10.0
         )
-        if result is None:
+        if path_label is None:
+            if gateway_manager._cloud_control:
+                result = await gateway_manager.cloud_control(
+                    "set_operation", level, mode_val, timeout=10.0
+                )
+                if result is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Control operation failed via cloud",
+                    )
+                return result
+            # Fallback for local gateways (v1r / Basic LAN): use the library's
+            # set_operation() on the gateway's own local connection so the write
+            # is translated correctly instead of a raw POST the gateway rejects.
+            result = await gateway_manager.local_control(
+                gateway_id, "set_operation", level, mode_val, timeout=10.0
+            )
+        if result is None or (path_label is not None and is_error_result(result)):
             raise HTTPException(
                 status_code=503,
                 detail="Control operation failed or gateway not available",
@@ -388,23 +401,30 @@ async def control_api(
                 detail="Invalid 'level' companion value. Must be an integer.",
             )
         mode = data["value"]
-        if gateway_manager._cloud_control:
-            result = await gateway_manager.cloud_control(
-                "set_operation", level_val, mode, timeout=10.0
-            )
-            if result is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Control operation failed via cloud",
-                )
-            return result
-        # Fallback for local gateways (v1r / Basic LAN): set_operation() on
-        # the local connection rather than a raw POST to /api/operation.
         gateway_id = get_default_gateway()
-        result = await gateway_manager.local_control(
+        # PW_LOCAL_FIRST: try a confirmed local v1r transport first. When
+        # the helper declines (flag off, non-v1r, LAN down or no local
+        # connection), the historical dispatch below runs verbatim.
+        path_label, result = await gateway_manager.control_write(
             gateway_id, "set_operation", level_val, mode, timeout=10.0
         )
-        if result is None:
+        if path_label is None:
+            if gateway_manager._cloud_control:
+                result = await gateway_manager.cloud_control(
+                    "set_operation", level_val, mode, timeout=10.0
+                )
+                if result is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Control operation failed via cloud",
+                    )
+                return result
+            # Fallback for local gateways (v1r / Basic LAN): set_operation() on
+            # the local connection rather than a raw POST to /api/operation.
+            result = await gateway_manager.local_control(
+                gateway_id, "set_operation", level_val, mode, timeout=10.0
+            )
+        if result is None or (path_label is not None and is_error_result(result)):
             raise HTTPException(
                 status_code=503,
                 detail="Control operation failed or gateway not available",
@@ -448,19 +468,26 @@ async def control_api(
 
     if path in control_map:
         method, args_fn = control_map[path]
-        if gateway_manager._cloud_control:
-            result = await gateway_manager.cloud_control(
-                method, *args_fn(data), timeout=10.0
-            )
-        else:
-            # Local mode (v1r / Basic LAN): call the mapped library method on
-            # the gateway's own connection instead of a raw POST, which the
-            # gateway's local API rejects with "Unknown API".
-            gateway_id = get_default_gateway()
-            result = await gateway_manager.local_control(
-                gateway_id, method, *args_fn(data), timeout=10.0
-            )
-        if result is None:
+        # PW_LOCAL_FIRST: try a confirmed local v1r transport first. When
+        # the helper declines (flag off, non-v1r, LAN down or no local
+        # connection), the historical dispatch below runs verbatim.
+        gateway_id = get_default_gateway()
+        path_label, result = await gateway_manager.control_write(
+            gateway_id, method, *args_fn(data), timeout=10.0
+        )
+        if path_label is None:
+            if gateway_manager._cloud_control:
+                result = await gateway_manager.cloud_control(
+                    method, *args_fn(data), timeout=10.0
+                )
+            else:
+                # Local mode (v1r / Basic LAN): call the mapped library method on
+                # the gateway's own connection instead of a raw POST, which the
+                # gateway's local API rejects with "Unknown API".
+                result = await gateway_manager.local_control(
+                    gateway_id, method, *args_fn(data), timeout=10.0
+                )
+        if result is None or (path_label is not None and is_error_result(result)):
             raise HTTPException(
                 status_code=503, detail=f"Control operation failed for {path}"
             )
@@ -679,7 +706,9 @@ async def get_soe():
     """Get state of energy (legacy proxy endpoint).
 
     Uses graceful degradation: returns cached data even if gateway is temporarily offline.
-    Returns Tesla-scaled percentage plus the preserved raw percentage if available.
+    Returns the raw gateway level in percentage, like the proxy (the Tesla app
+    scaled level is at /api/system_status/soe). raw_percentage carries the same
+    value for clients written against earlier server releases.
     """
     gateway_id = get_default_gateway()
     status = gateway_manager.get_gateway(gateway_id)
@@ -688,7 +717,7 @@ async def get_soe():
         return {"percentage": None, "raw_percentage": None}
 
     return {
-        "percentage": status.data.soe,
+        "percentage": status.data.soe_raw,
         "raw_percentage": status.data.soe_raw,
     }
 
@@ -797,15 +826,21 @@ async def get_freq():
     if status.data.freq is not None and not any(k.startswith("PW") for k in fcv.keys()):
         fcv["freq"] = status.data.freq
 
-    # Add grid status (numeric: 1 = UP, 0 = DOWN)
-    if status.data.grid_status == "UP":
-        fcv["grid_status"] = 1
-    elif status.data.grid_status == "DOWN":
-        fcv["grid_status"] = 0
-    else:
-        fcv["grid_status"] = 0
+    # Add grid status like the proxy's pw.grid_status("numeric"):
+    # 1 = UP, 0 = DOWN, -1 = SYNCING, null when unknown
+    fcv["grid_status"] = {"UP": 1, "DOWN": 0, "SYNCING": -1}.get(status.data.grid_status)
 
     return fcv
+
+
+def _power_values(aggregates: dict):
+    """Grid, home, solar and battery instant power; a missing meter or a None
+    reading counts as 0, as in the proxy's /csv and /json."""
+
+    def power(meter: str) -> float:
+        return (aggregates.get(meter) or {}).get("instant_power") or 0
+
+    return power("site"), power("load"), power("solar"), power("battery")
 
 
 @router.get("/csv")
@@ -829,10 +864,7 @@ async def get_csv(headers: Optional[str] = None):
 
     # Extract power values from aggregates (neg_solar correction applied at fetch time)
     aggregates = status.data.aggregates or {}
-    grid = aggregates.get("site", {}).get("instant_power", 0)
-    solar = aggregates.get("solar", {}).get("instant_power", 0)
-    battery = aggregates.get("battery", {}).get("instant_power", 0)
-    home = aggregates.get("load", {}).get("instant_power", 0)
+    grid, home, solar, battery = _power_values(aggregates)
     level = status.data.soe_raw or 0
 
     # Build CSV response
@@ -868,10 +900,7 @@ async def get_csv_v2(headers: Optional[str] = None):
 
     # Extract power values from aggregates (neg_solar correction applied at fetch time)
     aggregates = status.data.aggregates or {}
-    grid = aggregates.get("site", {}).get("instant_power", 0)
-    solar = aggregates.get("solar", {}).get("instant_power", 0)
-    battery = aggregates.get("battery", {}).get("instant_power", 0)
-    home = aggregates.get("load", {}).get("instant_power", 0)
+    grid, home, solar, battery = _power_values(aggregates)
     level = status.data.soe_raw or 0
 
     # Get grid status from cache (1=UP, 0=DOWN)
@@ -885,7 +914,7 @@ async def get_csv_v2(headers: Optional[str] = None):
     csv_data = ""
     if headers is not None:
         csv_data += "Grid,Home,Solar,Battery,BatteryLevel,GridStatus,Reserve\n"
-    csv_data += f"{grid:.2f},{home:.2f},{solar:.2f},{battery:.2f},{level:.2f},{gridstatus},{reserve:.0f}\n"
+    csv_data += f"{grid:.2f},{home:.2f},{solar:.2f},{battery:.2f},{level:.2f},{gridstatus},{int(reserve)}\n"
 
     return Response(content=csv_data, media_type="text/plain; charset=utf-8")
 
@@ -1318,14 +1347,11 @@ async def get_json():
 
     # Extract power values from aggregates (neg_solar correction applied at fetch time)
     aggregates = status.data.aggregates or {}
-    grid = aggregates.get("site", {}).get("instant_power", 0)
-    solar = aggregates.get("solar", {}).get("instant_power", 0)
-    battery = aggregates.get("battery", {}).get("instant_power", 0)
-    home = aggregates.get("load", {}).get("instant_power", 0)
+    grid, home, solar, battery = _power_values(aggregates)
 
-    # Get battery level (SOE)
-    soe = status.data.soe if status.data.soe is not None else 0
+    # Battery level: the raw gateway level, like the proxy's pw.level()
     soe_raw = status.data.soe_raw if status.data.soe_raw is not None else 0
+    soe = soe_raw
 
     # Convert grid_status to numeric (1=UP, 0=DOWN)
     grid_status_str = status.data.grid_status or "DOWN"
@@ -1374,7 +1400,7 @@ async def get_battery_power():
         return {"power": None}
 
     aggregates = status.data.aggregates or {}
-    battery_power = aggregates.get("battery", {}).get("instant_power", 0)
+    battery_power = (aggregates.get("battery") or {}).get("instant_power", 0)
 
     return {"power": battery_power}
 
@@ -1805,7 +1831,7 @@ async def get_api_meters_solar():
     if not status or not status.data or not status.data.aggregates:
         return []
 
-    solar = status.data.aggregates.get("solar", {})
+    solar = status.data.aggregates.get("solar") or {}
     return [solar] if solar else []
 
 
@@ -2014,10 +2040,10 @@ async def pw_power():
 
     aggregates = status.data.aggregates
     return {
-        "site": aggregates.get("site", {}).get("instant_power", 0),
-        "solar": aggregates.get("solar", {}).get("instant_power", 0),
-        "battery": aggregates.get("battery", {}).get("instant_power", 0),
-        "load": aggregates.get("load", {}).get("instant_power", 0),
+        "site": (aggregates.get("site") or {}).get("instant_power", 0),
+        "solar": (aggregates.get("solar") or {}).get("instant_power", 0),
+        "battery": (aggregates.get("battery") or {}).get("instant_power", 0),
+        "load": (aggregates.get("load") or {}).get("instant_power", 0),
     }
 
 
@@ -2030,7 +2056,7 @@ async def pw_site():
     if not status or not status.data or not status.data.aggregates:
         return {}
 
-    return status.data.aggregates.get("site", {})
+    return status.data.aggregates.get("site") or {}
 
 
 @router.get("/pw/solar")
@@ -2042,7 +2068,7 @@ async def pw_solar():
     if not status or not status.data or not status.data.aggregates:
         return {}
 
-    return status.data.aggregates.get("solar", {})
+    return status.data.aggregates.get("solar") or {}
 
 
 @router.get("/pw/battery")
@@ -2058,7 +2084,7 @@ async def pw_battery():
     if not status or not status.data or not status.data.aggregates:
         return {}
 
-    return status.data.aggregates.get("battery", {})
+    return status.data.aggregates.get("battery") or {}
 
 
 # The /pw/battery_blocks endpoint provides block-level detail.
@@ -2112,7 +2138,7 @@ async def pw_load():
     if not status or not status.data or not status.data.aggregates:
         return {}
 
-    return status.data.aggregates.get("load", {})
+    return status.data.aggregates.get("load") or {}
 
 
 @router.get("/pw/grid")
@@ -2124,7 +2150,7 @@ async def pw_grid():
     if not status or not status.data or not status.data.aggregates:
         return {}
 
-    return status.data.aggregates.get("site", {})
+    return status.data.aggregates.get("site") or {}
 
 
 @router.get("/pw/home")
@@ -2136,7 +2162,7 @@ async def pw_home():
     if not status or not status.data or not status.data.aggregates:
         return {}
 
-    return status.data.aggregates.get("load", {})
+    return status.data.aggregates.get("load") or {}
 
 
 @router.get("/pw/vitals")
@@ -2244,15 +2270,7 @@ async def pw_version():
     if version is None:
         return {"version": "Unknown", "vint": 0}
 
-    vint = 0
-    try:
-        parts = version.split(".")
-        if len(parts) >= 2:
-            vint = int(parts[0]) * 100 + int(parts[1])
-    except Exception:
-        pass
-
-    return {"version": version, "vint": vint}
+    return {"version": version, "vint": parse_version(version)}
 
 
 @router.get("/pw/status")
@@ -2422,15 +2440,24 @@ async def get_stats():
         if status and status.online:
             online_count += 1
 
-        # Detect connection modes
-        if gw.fleetapi:
-            fleetapi = True
-        if gw.cloud_mode:
-            cloudmode = True
-        if gw.host and not gw.basic_lan:
-            tedapi = True
-        if gw.basic_lan:
-            basiclan = True
+        # Connection modes: the live connection once polled (failover can
+        # move it off the configured mode, e.g. FleetAPI -> Cloud), else the
+        # configuration
+        live = status.data.connection_mode if status and status.data else None
+        if live:
+            fleetapi = fleetapi or live == "FleetAPI"
+            cloudmode = cloudmode or live in ("Cloud", "FleetAPI")
+            tedapi = tedapi or live.startswith("TEDAPI")
+            basiclan = basiclan or live == "Basic LAN"
+        else:
+            if gw.fleetapi:
+                fleetapi = True
+            if gw.cloud_mode:
+                cloudmode = True
+            if gw.host and (gw.gw_pwd or gw.rsa_key_configured):
+                tedapi = True
+            if gw.basic_lan:
+                basiclan = True
 
         # Get site ID if available
         if gw.site_id:
@@ -2542,6 +2569,8 @@ async def get_stats():
         "PW_TEDAPI_PROBE_INTERVAL": settings.tedapi_probe_interval,
         "PW_TEDAPI_AUTH_MODE": settings.tedapi_auth_mode,
         "PW_TEDAPI_API_VERSION": settings.tedapi_api_version,
+        "PW_FAILOVER": settings.failover,
+        "PW_CLOUD_HYBRID": settings.cloud_hybrid,
     }
 
     # Build connection health section
@@ -2593,9 +2622,11 @@ async def get_stats():
         "tedapi_mode": tedapi_mode,
         "tedapi_auth_mode": tedapi_auth_mode,
         "tedapi_api_version": tedapi_api_version,
-        "siteid": siteid,
+        # Kept for proxy compatibility but masked like PW_SITEID and
+        # PW_CACHE_FILE in config: cf is a path under PW_AUTH_PATH.
+        "siteid": "**********" if siteid else None,
         "counter": 0,  # Legacy field, not used
-        "cf": settings.cache_file,
+        "cf": "**********" if settings.cache_file else None,
         "config": config,
         "connection_health": connection_health,
         "gateways": {
@@ -2636,17 +2667,9 @@ async def get_version():
     if status and status.data:
         version = status.data.version
 
+    # Same payload as the proxy: "SolarOnly" when there is no version, and vint
+    # from pypowerwall's parse_version (e.g. "26.26.11" -> 262611)
     if version is None:
-        return {"version": "Unknown", "vint": 0}
+        return {"version": "SolarOnly", "vint": 0}
 
-    # Parse version string to integer (basic implementation)
-    vint = 0
-    try:
-        # Extract numbers from version string like "23.44.0"
-        parts = version.split(".")
-        if len(parts) >= 2:
-            vint = int(parts[0]) * 100 + int(parts[1])
-    except Exception:
-        pass
-
-    return {"version": version, "vint": vint}
+    return {"version": version, "vint": parse_version(version)}

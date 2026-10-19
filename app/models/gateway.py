@@ -169,10 +169,17 @@ class PowerwallData(BaseModel):
     grid_export: Optional[str] = None
     pw3: Optional[bool] = None  # True if Powerwall 3 system
     tedapi_mode: Optional[str] = None  # TEDAPI mode (e.g., "FleetAPI")
+<<<<<<< HEAD
     # Active TEDAPI transport as reported by the live pypowerwall client (may
     # differ from the requested values, e.g. hybrid mode always speaks basic).
     tedapi_auth_mode: Optional[str] = None  # "basic" | "bearer"
     tedapi_api_version: Optional[str] = None  # "V2024_06" | "V2026_06"
+=======
+    # Connection pypowerwall is using now; failover can move it off the
+    # configured mode: "TEDAPI v1r", "TEDAPI", "Local", "Basic LAN",
+    # "Cloud" or "FleetAPI" (None before the first poll)
+    connection_mode: Optional[str] = None
+>>>>>>> root/main
     tedapi_config: Optional[Dict[str, Any]] = None  # Cached /tedapi/config response; battery_blocks[].type used for model detection
     timestamp: Optional[float] = None
 

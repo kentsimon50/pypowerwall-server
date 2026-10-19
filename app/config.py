@@ -4,6 +4,9 @@ Configuration Management for PyPowerwall Server
 This module handles all server configuration through environment variables and provides
 100% backward compatibility with the original pypowerwall proxy server settings.
 
+The full reference for every setting is API.md (tests/test_api_md.py checks
+that each Settings field is documented there).
+
 Configuration Methods:
 
     1. Multi-Gateway Configuration (recommended for multiple Powerwalls):
@@ -70,15 +73,28 @@ Environment Variables (Proxy Compatible):
         PW_RATE_LIMIT_MAX_BUCKETS     - Max tracked client IPs before pruning (default: 10000)
 
     UI and Advanced:
-        PW_STYLE             - UI style: clear/black/white/grafana/grafana-dark (default: "clear")
+        PW_STYLE             - UI style: clear/black/white/grafana/grafana-dark/
+                               solar/dakboard (default: "clear")
         PW_AUTH_MODE         - Auth mode: cookie/token (default: "cookie")
         PW_CACHE_FILE        - Cache file path (default: auto - uses PW_AUTH_PATH/.powerwall or /tmp/.powerwall)
         PW_SITEID            - Tesla site ID for multi-site accounts (default: none)
         PW_CONTROL_SECRET    - Enable control commands (default: none/disabled)
-        PW_NEG_SOLAR         - Allow negative solar values "yes"/"no" (default: "no")
+        PW_ISLANDING_COOLDOWN - Seconds between islanding commands per gateway
+                               (default: 30; 0 disables)
+        PW_LOCAL_FIRST       - Prefer local v1r writes "yes"/"no" (default: "no")
+        PW_CLOUD_HYBRID      - Start the hybrid cloud connection for a local gateway
+                               with PW_EMAIL even without PW_CONTROL_SECRET, for its
+                               read-only values "yes"/"no" (default: "no")
+        PW_NEG_SOLAR         - Allow negative solar values "yes"/"no" (default: "yes")
         PW_RSA_KEY_PATH      - Path to RSA-4096 private key PEM for TEDAPI v1r LAN access (default: none)
         PW_WIFI_HOST         - WiFi host IP for TEDAPI v1r WiFi fallback (default: none)
+        PW_FAILOVER          - Transport/mode failover "yes"/"no" (default: "yes")
         PROXY_BASE_URL       - Base URL for reverse proxy (default: "/")
+        CORS_ORIGINS         - JSON array of allowed CORS origins (default: ["*"])
+        PW_CONFIG            - Gateway config file path (YAML/JSON; overrides
+                               PW_GATEWAYS and the single-gateway variables)
+
+    MQTT (MQTT_HOST enables publishing; all MQTT_* settings are in API.md)
 
     Time-Series Storage (Daily Energy Stats):
         PW_TIMESERIES_RETENTION       - Raw 5s sample retention, e.g. "24h" (default), "7d",
@@ -116,7 +132,8 @@ Connection Modes:
     FleetAPI Mode:
         • Official Tesla API
         • Requires app registration with Tesla
-        • Configuration: PW_EMAIL + PW_AUTH_PATH + fleetapi=true
+        • Configuration: a PW_GATEWAYS / PW_CONFIG entry with email + authpath
+          + fleetapi: true
 
 Gateway Configuration Priority:
 
@@ -178,7 +195,7 @@ Adding New Settings:
 
     3. Use in code via settings.new_setting
 
-    4. Update README with new variable
+    4. Document it in API.md (tests/test_api_md.py enforces this)
 
 Accessing Configuration:
 
@@ -198,14 +215,45 @@ Accessing Configuration:
 import json
 import logging
 import os
-from typing import List, Optional
+import re
+from typing import List, Optional, Union, get_args, get_origin
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+from pypowerwall.cloud.pypowerwall_cloud import AUTHFILE as CLOUD_AUTH_FILE
+from pypowerwall.fleetapi.fleetapi import CONFIGFILE as FLEETAPI_FILE
 
 logger = logging.getLogger(__name__)
 
+
+def _first_auth_email(path: str) -> Optional[str]:
+    """First account email in a pypowerwall cloud auth file, or None."""
+    try:
+        with open(path, "r") as file:
+            accounts = json.load(file)
+        return next(iter(accounts), None) if isinstance(accounts, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+_TRUE_WORDS = {"yes", "y", "true", "on", "1"}
+_FALSE_WORDS = {"no", "n", "false", "off", "0"}
+_INLINE_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _scalar_kind(annotation):
+    """bool or int for a bool/int (or Optional of one) annotation, else None."""
+    if get_origin(annotation) is Union:
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        annotation = args[0] if len(args) == 1 else None
+    if annotation is bool:
+        return bool
+    if annotation is int:
+        return int
+    return None
+
+
 # Server version
-SERVER_VERSION = "0.10.0"
+SERVER_VERSION = "0.11.1"
 
 # MQTT control bitmask values for MQTT_CONTROLS (bits only, no names).
 # Default 0 keeps MQTT monitoring-only, exactly as before controls existed.
@@ -364,6 +412,12 @@ class Settings(BaseSettings):
     cache_file: Optional[str] = Field(default=None, alias="PW_CACHE_FILE")
     siteid: Optional[str] = Field(default=None, alias="PW_SITEID")
     control_secret: Optional[str] = Field(default=None, alias="PW_CONTROL_SECRET")
+    cloud_hybrid: bool = Field(
+        default=False, alias="PW_CLOUD_HYBRID"
+    )  # Hybrid cloud connection without PW_CONTROL_SECRET (read-only values)
+    local_first: bool = Field(
+        default=False, alias="PW_LOCAL_FIRST"
+    )  # Try local v1r writes before cloud (default: no = cloud first)
     islanding_cooldown: int = Field(
         default=30, alias="PW_ISLANDING_COOLDOWN"
     )  # Server-enforced seconds between islanding commands per gateway (0 disables)
@@ -374,9 +428,12 @@ class Settings(BaseSettings):
     pw_wifi_host: Optional[str] = Field(
         default=None, alias="PW_WIFI_HOST"
     )  # WiFi host IP for TEDAPI v1r WiFi fallback
+    failover: bool = Field(
+        default=True, alias="PW_FAILOVER"
+    )  # pypowerwall failover; false pins the configured transports
     neg_solar: bool = Field(
-        default=False, alias="PW_NEG_SOLAR"
-    )  # Allow negative solar values (default: no)
+        default=True, alias="PW_NEG_SOLAR"
+    )  # Allow negative solar values (default: yes, as in the proxy)
 
     # TEDAPI transport defaults (same env names as the pypowerwall proxy).
     # Per-gateway `tedapi_auth_mode` / `tedapi_api_version` override these.
@@ -444,6 +501,43 @@ class Settings(BaseSettings):
     )  # Bitmask opt-in for MQTT controls (0 = monitoring only; 1 reserve,
     # 2 mode, 4 grid_charging, 8 grid_export, 16 islanding; e.g. 15 = all
     # but islanding, 31 = all). Islanding needs its own explicit bit.
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _lenient_bool_and_int(cls, v, info):
+        """Take bool and int values the proxy took instead of failing startup.
+
+        Surrounding spaces and an inline " # comment" are ignored (plain
+        `docker run --env-file` passes comments through), an empty value
+        means the default, and an unrecognized value logs a warning and uses
+        the default. PW_HTTPS also takes the proxy's "http". String settings
+        (passwords, hosts) are left as given; MQTT_CONTROLS has its own
+        fail-closed parsing below.
+        """
+        if not isinstance(v, str) or info.field_name == "mqtt_controls":
+            return v
+        field = cls.model_fields[info.field_name]
+        kind = _scalar_kind(field.annotation)
+        if kind is None:
+            return v
+        text = _INLINE_COMMENT.sub("", v.strip())
+        if text == "":
+            return field.default
+        if kind is bool:
+            word = text.lower()
+            if word in _TRUE_WORDS or (info.field_name == "https_mode" and word == "http"):
+                return True
+            if word in _FALSE_WORDS:
+                return False
+        else:
+            try:
+                return int(text)
+            except ValueError:
+                pass
+        logger.warning(
+            f"Invalid {field.alias or info.field_name}={v!r}; using the default ({field.default!r})"
+        )
+        return field.default
 
     @field_validator("mqtt_controls", mode="before")
     @classmethod
@@ -658,8 +752,20 @@ class Settings(BaseSettings):
                 )
             return
 
-        # Fall back to single gateway mode (legacy compatibility)
-        if self.pw_host or self.pw_email:
+        # Fall back to single gateway mode (legacy compatibility). With no
+        # PW_HOST, pick FleetAPI or Cloud from the auth files the way the
+        # proxy's pypowerwall auto_select does: .pypowerwall.fleetapi first,
+        # then .pypowerwall.auth, whose first account fills a missing PW_EMAIL.
+        email = self.pw_email
+        fleetapi = False
+        if not self.pw_host:
+            # pypowerwall expands "~" in authpath; look where it will
+            authpath = os.path.expanduser(self.pw_authpath or "")
+            if os.path.exists(os.path.join(authpath, FLEETAPI_FILE)):
+                fleetapi = True
+            elif not email:
+                email = _first_auth_email(os.path.join(authpath, CLOUD_AUTH_FILE))
+        if self.pw_host or email or fleetapi:
             self.gateways = [
                 GatewayConfig(
                     id="default",
@@ -669,12 +775,13 @@ class Settings(BaseSettings):
                     password=self.pw_password,
                     rsa_key_path=self.pw_rsa_key_path,
                     wifi_host=self.pw_wifi_host,
-                    email=self.pw_email,
+                    email=email,
                     authpath=self.pw_authpath,
                     timezone=self.pw_timezone,
-                    cloud_mode=bool(self.pw_email and not self.pw_host),
                     tedapi_auth_mode=self.tedapi_auth_mode,
                     tedapi_api_version=self.tedapi_api_version,
+                    cloud_mode=bool((email or fleetapi) and not self.pw_host),
+                    fleetapi=fleetapi,
                 )
             ]
 

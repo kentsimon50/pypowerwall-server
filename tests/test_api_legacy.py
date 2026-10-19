@@ -21,9 +21,7 @@ def test_soe_endpoint(client, connected_gateway):
     response = client.get("/soe")
     assert response.status_code == 200
     data = response.json()
-    assert data["percentage"] == pytest.approx(
-        raw_to_tesla_battery_percent(85.5)
-    )
+    assert data["percentage"] == 85.5  # raw gateway level, like the proxy
     assert data["raw_percentage"] == 85.5
 
 
@@ -1041,7 +1039,29 @@ def test_pw_version(client, connected_gateway):
     assert response.status_code == 200
     data = response.json()
     assert data["version"] == "23.44.0"
-    assert data["vint"] == 2344
+    assert data["vint"] == 234400
+
+
+@pytest.mark.parametrize("version, vint", [
+    ("23.44.0", 234400),
+    ("26.26.11 c4db63ce", 262611),
+    ("24.4", 240400),
+    ("unknown", None),
+])
+def test_version_vint_matches_proxy(client, connected_gateway, version, vint):
+    """/version encodes vint like the proxy (pypowerwall.parse_version)."""
+    connected_gateway.data.version = version
+    response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json() == {"version": version, "vint": vint}
+
+
+def test_version_without_firmware_matches_proxy(client, connected_gateway):
+    """/version reports SolarOnly when there is no firmware version, like the proxy."""
+    connected_gateway.data.version = None
+    response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json() == {"version": "SolarOnly", "vint": 0}
 
 
 def test_pw_status(client, connected_gateway):

@@ -2,6 +2,152 @@
 
 ## Version History
 
+### [0.12.0] - Upcoming
+
+**Changed:**
+- **Legacy endpoints return what the proxy returns**, so proxy clients such
+  as Powerwall-Dashboard's Telegraf can switch to the server unchanged
+  (jasonacox/Powerwall-Dashboard#878):
+  - `/soe` `percentage` and `/json` `soe` are the raw gateway battery level,
+    as in the proxy. They were the Tesla app scaled level. `raw_percentage`
+    and `soe_raw` are unchanged, and the scaled level stays at
+    `/api/system_status/soe`. Clients that read the scaled value from `/soe`
+    should use `/api/system_status/soe`.
+  - `/freq` `grid_status` is `-1` while the grid is syncing and `null` when
+    unknown (it was `0`, which reads as a grid outage).
+- **Behavior change: `PW_NEG_SOLAR` now defaults to `yes`**, the proxy's
+  default, so `/aggregates`, `/csv`, `/json`, MQTT and the Console report the
+  meter's solar and home values as the proxy does. With the old default
+  (`no`), negative solar (a few tens of watts overnight while the inverters
+  idle) was set to 0 and added to home load. If you didn't set
+  `PW_NEG_SOLAR`, you may now see small negative solar readings at night and
+  slightly lower home load. Daily solar totals in the history are unchanged
+  (they already ignore negative solar). Set `PW_NEG_SOLAR=no` to keep the old
+  behavior.
+- **The hybrid cloud connection starts only when it is wanted**, like the
+  proxy: with `PW_CONTROL_SECRET` (writes need it) or the new
+  `PW_CLOUD_HYBRID=yes`. It used to start for any local gateway with
+  `PW_EMAIL`, so Powerwall 2 local setups, whose login needs an email, opened
+  a Tesla cloud session and logged retry warnings they never asked for. If you
+  run Basic LAN with `PW_EMAIL` and no control secret to see the
+  cloud-sourced mode and reserve, set `PW_CLOUD_HYBRID=yes`. Control setups
+  (`PW_CONTROL_SECRET` set), Cloud and FleetAPI are unchanged. `/stats`
+  reports the setting under `config`.
+
+**Fixed:**
+- **The Console and `/stats` show the connection in use** — pypowerwall's
+  failover can move a connection off its configured mode (FleetAPI to Cloud,
+  local to Cloud), but the Console and `/stats` (`mode`, `fleetapi`,
+  `cloudmode`, `tedapi`, `basiclan`) kept reporting the configuration. They
+  now report the live connection, recorded on every poll; `/api/gateways/`
+  has it as `data.connection_mode`. Before the first poll they show the
+  configuration.
+- **FleetAPI works with the single-gateway settings**, as in the proxy: with
+  no `PW_HOST`, `.pypowerwall.fleetapi` in `PW_AUTH_PATH` selects FleetAPI
+  (before Cloud), and `.pypowerwall.auth` selects Cloud, supplying the email
+  when `PW_EMAIL` is empty. FleetAPI used to need a `PW_GATEWAYS` entry; a
+  proxy-style FleetAPI setup tried the owner Cloud API and never connected.
+- **Powerwall 2 local mode gets the full local API** — `PW_HOST` +
+  `PW_PASSWORD` without a gateway password was always treated as Powerwall 3
+  Basic LAN, which skipped vitals, alerts, status, firmware, site name,
+  mode, reserve and system status (so `/pod` lost pack energy and reserve).
+  The server now tells them apart on connect: a gateway that answers
+  `/api/status` is polled in full, like the proxy's local mode; one that
+  doesn't is Basic LAN as before, re-checked every 5 minutes so a Powerwall 2
+  whose status request failed once still gets full polling. The TEDAPI probe runs only for gateways
+  configured for TEDAPI, and `/stats` reports `tedapi: false` for local and
+  Basic LAN gateways.
+- **A proxy `pypowerwall.env` no longer stops the server from starting** —
+  boolean and integer settings that the proxy took now parse instead of
+  failing startup with a validation error: an empty value (`PW_DEBUG=`,
+  `PW_CACHE_EXPIRE=`) means the default, surrounding spaces and an inline
+  ` # comment` are ignored (plain `docker run --env-file` passes comments
+  through), `PW_HTTPS=http` is accepted, and an unrecognized value logs a
+  warning and uses the default. String settings such as passwords are used
+  exactly as given.
+- **`PW_NEG_SOLAR=no` no longer crashes on a missing reading** — a solar or
+  load meter reporting `instant_power: null` raised a `TypeError` on every
+  poll and marked the gateway offline. (#72) The multi-gateway totals
+  (`/api/aggregate/*`, the Console's live stream) count a missing reading as 0.
+- **`/csv`, `/csv/v2` and `/json` treat missing power readings as 0**, as
+  the proxy does, instead of returning HTTP 500. `/csv/v2` truncates the
+  reserve like the proxy (19.9 → 19). `/battery` and `/pw/power` no longer
+  return HTTP 500 when a meter block is missing, and the `/pw/<meter>` routes
+  return `{}` for it.
+
+### [0.11.1] - 2026-10-18
+
+**Fixed:**
+- **`/version` matches the proxy** — `vint` now uses pypowerwall's
+  `parse_version`, as the proxy does: firmware `26.26.11` gives `262611`
+  (it was `2626`, dropping the patch level, and `23.44.0` gave `2344` instead
+  of `234400`). With no firmware version, `/version` returns
+  `{"version": "SolarOnly", "vint": 0}` like the proxy (it returned
+  `"Unknown"`). `/pw/version` gets the same `vint` fix and keeps `"Unknown"`.
+  Found comparing the server with the proxy for the Powerwall-Dashboard
+  switch (jasonacox/Powerwall-Dashboard#878).
+
+### [0.11.0] - 2026-10-18
+
+**Added:**
+- **`PW_FAILOVER` setting** — exposes pypowerwall's `failover` option
+  (default `yes`). Set `PW_FAILOVER=no` to pin the configured transports: the
+  v1r leader stays on the wired LAN instead of switching to `PW_WIFI_HOST`, a
+  failed request returns no data instead of being rerouted, and a local
+  connection never falls back to FleetAPI or Cloud mode. `/stats` reports it
+  under `config`. Requested by @BJReplay (jasonacox/pypowerwall#402).
+- **Home Assistant: one device per Powerwall** — each battery's entities
+  (capacity, charge, per-unit temperature and fan sensors) are now grouped
+  under their own HA device named `Powerwall {serial}` and keyed by serial,
+  linked to the gateway device via `via_device`. Entity `unique_id`s and
+  state topics are unchanged, so existing entities keep their entity IDs
+  and history. Their display names change to follow the new device, e.g.
+  "Default Gateway Battery 1 Capacity" becomes "Powerwall TG… Capacity".
+  (#153)
+- **Cloud-control retry with backoff** — when the hybrid cloud-control
+  connection cannot be established at startup (Tesla cloud unreachable,
+  first-setup token exchange failing), the server now retries with
+  exponential backoff (60 s doubling up to 300 s) instead of leaving
+  control unavailable until a restart. An attempt counts only when it
+  yields a connected cloud or FleetAPI connection. (#156)
+- **`PW_LOCAL_FIRST` (opt-in, default `no`)** — with `PW_LOCAL_FIRST=yes`, reserve/mode/grid control writes (HTTP and MQTT) try a confirmed local v1r transport first while its LAN is up and a local connection exists — so the LAN-up / internet-down case keeps working, where local writes are the only path observed to confirm synchronously. Otherwise the write runs unchanged through the normal dispatch (cloud first when configured). Any dispatched local attempt — success, timeout or library error — is final and never followed by a second write, since a timed-out write may still have been applied. Default `no` keeps the historical behavior. Islanding is untouched (always local v1r). (issue #149)
+
+**Docs:**
+- **API reference (`API.md`)** — one reference for every environment variable,
+  config file field and route: defaults, the connection modes each setting
+  applies to, proxy-compatible names, auth requirements, the control write path
+  and islanding, and safe-default behavior. It also lists the proxy variables
+  the server accepts but ignores. A test fails when a setting or route is added
+  without an API.md entry. The README's endpoint list now points to it.
+
+**Fixed:**
+- **History samples survive storage wait timeouts** — Slow SQLite writes no longer lose accepted power, temperature or fan records when polling's five-second wait expires. Accepted writes finish in order, with up to ten seconds to drain on shutdown. Storage status reports pending and rejected writes.
+- **TEDAPI recovery no longer misses a connection that drifted to cloud
+  reads** — a recovery `connect()` that timed out during a gateway reboot
+  could leave pypowerwall's failover active: the connection stayed on cloud reads
+  (`pw.tedapi` unset, mode "cloud") while the TEDAPI probe skipped it
+  silently, holding a gateway on cloud data for hours after a
+  firmware-update reboot. The probe now runs for every local TEDAPI
+  gateway (PW3 Basic LAN stays exempt — it has no TEDAPI client), counts
+  a connection that left TEDAPI mode as a failed probe with a warning
+  naming the mode, and enters SolarOnly fallback after the usual
+  threshold. Recovery builds a fresh connection the same way startup
+  does and swaps it in only when it comes up in TEDAPI mode and reports
+  a version — the drifted object cannot recover via `connect()`, since
+  pypowerwall restores the configured mode only when every mode fails
+  (jasonacox/pypowerwall#366) — and the existing connection keeps
+  serving until a replacement is verified. (#156)
+- **Docs: v1r follower Powerwalls need `PW_WIFI_HOST`** — the README said `PW_WIFI_HOST` defaults to `192.168.91.1`; it isn't set by default, and without it v1r shows only the leader Powerwall. The README now says to set it to the gateway's WiFi access point for multi-Powerwall sites, and its v1r examples use the wired LAN IP (`10.42.1.x`) for `PW_HOST` instead of the WiFi address. The startup warning names `192.168.91.1` instead of `<gateway-ip>` (#157).
+- **`/stats` reports the real `PW_NEG_SOLAR`** — `config.PW_NEG_SOLAR` was always `true`; it now shows the setting (default `no`).
+- **`/stats` masks the top-level `siteid` and `cf`** — `config` already masked `PW_SITEID` and `PW_CACHE_FILE`, but the proxy-compatible top-level `siteid` and `cf` (the cache file path under `PW_AUTH_PATH`) were readable on this unauthenticated route. Both keys stay, masked the same way.
+- **`PW_SITEID` applies to Cloud and FleetAPI gateways** — it was passed to local and hybrid connections only, so a Cloud or FleetAPI gateway on a multi-site account used the site saved by `pypowerwall setup` (or the first site) instead.
+
+**Changed:**
+- **pypowerwall upgraded to 0.21.0** (from 0.20.0; `requirements.txt` pin and `pyproject.toml` minimum). Library changes that reach server users:
+  - Powerwall 2 per-Powerwall vitals: lifetime charged and discharged energy, inverter state and heatsink temperature, `THC_State` and the `SYNC_*` values, which were `null` (jasonacox/pypowerwall#416). Powerwall 3 sites with a SYNC device report `SYNC_ExternallyPowered` / `SYNC_SiteSwitchEnabled` as `false` instead of `null`.
+  - TEDAPI `/api/system_status` fills `max_charge_power`, `max_discharge_power` and `max_apparent_power` the way the gateway's local API reports them, and `inverter_nominal_usable_power` where the inverters report it (jasonacox/pypowerwall#423).
+  - `Powerwall.connect()` starts from the configured mode after a failover, so a reconnect tries local again first (jasonacox/pypowerwall#425).
+
 ### [0.10.0] - 2026-10-11
 
 **Added:**

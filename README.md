@@ -9,6 +9,9 @@
 
 A high-performance FastAPI-based server for monitoring and managing Tesla Powerwall systems. Designed as the next-generation evolution of the [pypowerwall proxy](https://github.com/jasonacox/pypowerwall/tree/main/proxy#pypowerwall-proxy-server) with multi-gateway support, real-time monitoring, and a built-in status console.
 
+**Reference:** [API.md](API.md) lists every environment variable, config file
+field and API route.
+
 <img alt="PyPowerwall Server Console" src="https://github.com/user-attachments/assets/0a12fa85-b054-4a62-90a6-f1557bec9e56" />
 
 The **Energy** panel toggles between **Energy Summary** (current kW totals) and **Energy Trend** (raw kW data with battery level % overlay).
@@ -53,13 +56,13 @@ Not sure which mode to run? Pick the row that matches your setup — then follow
 
 | Mode | Use when | Required settings | Data | Control |
 |------|----------|-------------------|------|---------|
-| **TEDAPI** *(default)* | You can reach the gateway from your local network (`192.168.91.1`) | `PW_HOST` + `PW_GW_PWD` | Full local metrics — power flows, vitals, strings, per-Powerwall detail | Add `PW_EMAIL` + `PW_AUTH_PATH` for hybrid cloud control |
+| **TEDAPI** *(default)* | You can reach the gateway from your local network (`192.168.91.1`) | `PW_HOST` + `PW_GW_PWD` | Full local metrics — power flows, vitals, strings, per-Powerwall detail | Add `PW_EMAIL` + `PW_AUTH_PATH` + `PW_CONTROL_SECRET` for hybrid cloud control |
 | **TEDAPI v1r** | Same, but connecting over wired LAN with a registered RSA key | `PW_HOST` + `PW_GW_PWD` + `PW_RSA_KEY_PATH` (add `PW_WIFI_HOST` for follower Powerwall data) | Full local metrics | Authenticated local islanding with `PW_CONTROL_SECRET`; add `PW_EMAIL` + `PW_AUTH_PATH` for other hybrid cloud control |
-| **Basic LAN** *(Powerwall 3)* | PW3 reachable on its wired vendor subnet — no gateway password or RSA key needed | `PW_HOST` + `PW_PASSWORD` (customer password = last 5 chars of the gateway password) | Core metrics only — power flows, battery SoC, grid status | Add `PW_EMAIL` + `PW_AUTH_PATH` for hybrid cloud control (local reads + cloud writes) |
+| **Basic LAN** *(Powerwall 3)* | PW3 reachable on its wired vendor subnet — no gateway password or RSA key needed | `PW_HOST` + `PW_PASSWORD` (customer password = last 5 chars of the gateway password) | Core metrics only — power flows, battery SoC, grid status | Add `PW_EMAIL` + `PW_AUTH_PATH` + `PW_CONTROL_SECRET` for hybrid cloud control (local reads + cloud writes) |
 | **Cloud** | No local network access to the system | `PW_EMAIL` + `PW_AUTH_PATH` (one-time `python -m pypowerwall setup`) | Standard cloud metrics | Yes |
-| **FleetAPI** | Remote access via Tesla's official Fleet API | `PW_GATEWAYS` (or `gateways.yaml`) entry with `email` + `authpath` + `fleetapi: true` | Standard cloud metrics | Yes |
+| **FleetAPI** | Remote access via Tesla's official Fleet API | `PW_AUTH_PATH` holding `.pypowerwall.fleetapi` (one-time `python -m pypowerwall setup -fleetapi`) with no `PW_HOST`, or a `PW_GATEWAYS` (or `gateways.yaml`) entry with `email` + `authpath` + `fleetapi: true` | Standard cloud metrics | Yes |
 
-Local v1r and Basic LAN modes can perform supported control operations when `PW_CONTROL_SECRET` is set. Without cloud credentials, `/control/reserve`, `/control/mode`, and `/control/grid_charging` use the gateway's local connection. With `PW_EMAIL` and `PW_AUTH_PATH` configured (hybrid mode), those operations use the cloud connection while monitoring remains local. `POST /control/islanding` is different: it is available only in TEDAPI v1r mode, requires a registered RSA key, always uses the local gateway connection, and does not fall back to cloud control.
+Local v1r and Basic LAN modes can perform supported control operations when `PW_CONTROL_SECRET` is set. Without cloud credentials, `/control/reserve`, `/control/mode`, and `/control/grid_charging` use the gateway's local connection. With `PW_EMAIL` and `PW_AUTH_PATH` configured (hybrid mode), those operations use the cloud connection while monitoring remains local. Set `PW_LOCAL_FIRST=yes` to try a confirmed local v1r transport first while the LAN is up and a local connection exists; when nothing local can be attempted, the write runs through the normal dispatch as before (covers the LAN-up / internet-down case). On some older Powerwall 3 firmware (26.10.4), the gateway stored local config writes without acting on them right away (jasonacox/pypowerwall#321); on 26.18.1 it acted within about 30–45 s. `POST /control/islanding` is different: it is available only in TEDAPI v1r mode, requires a registered RSA key, always uses the local gateway connection, and does not fall back to cloud control.
 
 #### TEDAPI Mode (Local Access)
 ```bash
@@ -81,7 +84,7 @@ docker run -d \
 docker run -d \
   --name pypowerwall-server \
   --network host \
-  -e PW_HOST=192.168.91.1 \
+  -e PW_HOST=10.42.1.40 \
   -e PW_GW_PWD=your_gateway_password \
   -e PW_RSA_KEY_PATH=/keys/tedapi_rsa_private.pem \
   -e PW_WIFI_HOST=192.168.91.1 \
@@ -90,7 +93,11 @@ docker run -d \
   jasonacox/pypowerwall-server
 ```
 
-> **Note:** `PW_WIFI_HOST` is the IP address pypowerwall uses for the WiFi fallback path in v1r mode. It defaults to `192.168.91.1`. Only set it if your gateway is on a different IP (e.g. behind a travel router).
+> **Note:** `PW_HOST` is the gateway's wired LAN IP for v1r: its vendor-subnet address (`10.42.1.x`), or its home LAN IP on units that answer v1r there.
+>
+> **Note:** v1r reaches only the leader Powerwall, so with two or more Powerwalls set `PW_WIFI_HOST` to the gateway's WiFi access point (`192.168.91.1`, or the address that forwards to it, e.g. behind a travel router). Follower Powerwalls are queried over it, and it is the fallback if the wired LAN goes down. It is not set by default: without it the console shows only the leader. The server must be able to reach that address, by joining the gateway's `TeslaPW_` WiFi network or through a static route.
+>
+> **Note:** `PW_FAILOVER=no` pins the configured transports (default `yes`). The v1r leader then stays on the wired LAN instead of switching to `PW_WIFI_HOST`, a failed request returns no data instead of being rerouted, and a local connection never falls back to FleetAPI or Cloud mode. Followers still use `PW_WIFI_HOST`. `/stats` reports the setting under `config`.
 >
 > **Note:** The `-v pws-data:/data` mount persists the daily energy, temperature and fan history (SQLite time-series store) across container upgrades. Omit it if you run with `PW_TIMESERIES_RETENTION=-1` (subsystem disabled).
 
@@ -125,6 +132,7 @@ docker run -d \
   -e PW_PASSWORD=your_customer_password \
   -e PW_EMAIL="your@email.com" \
   -e PW_AUTH_PATH=/auth \
+  -e PW_CONTROL_SECRET=choose_a_long_secret \
   -v ~/.pypowerwall:/auth \
   -v pws-data:/data \
   jasonacox/pypowerwall-server
@@ -132,6 +140,8 @@ docker run -d \
 # One-time setup (runs the Tesla auth flow to generate the token files)
 docker exec -it pypowerwall-server python -m pypowerwall setup
 ```
+
+The cloud connection starts when `PW_CONTROL_SECRET` is set. To show the cloud-sourced mode and reserve without enabling control, set `PW_CLOUD_HYBRID=yes` instead.
 
 Both pieces are required for control: `PW_EMAIL` identifies the Tesla account, and `PW_AUTH_PATH` points at the directory holding the `.pypowerwall.auth` / `.pypowerwall.site` token files created by the one-time setup (email alone is not enough — the cloud connection has no password to log in with). With both set, `/control/reserve`, `/control/mode` and `/control/grid_charging` route through the cloud connection while all monitoring data keeps coming from the local Basic LAN endpoints (no internet needed for reads). The Console shows **Hybrid** as the connect mode and tracks both links separately (`Local` / `Cloud` sub-rows): if the internet drops, the Connection card reads **Degraded** with `Local: Healthy / Cloud: Unavailable` instead of reporting plain health from the local link alone. If the cloud connection can't be established at all, monitoring is unaffected, control requests return an error, and the Console's Powerwall Mode shows `--` (unavailable) rather than a made-up value; when the cloud link drops *after* having been up, the last known mode/reserve are shown marked `(stale)` with their fetch time exposed via `/api/operation`.
 
@@ -189,6 +199,9 @@ pypowerwall-server --email "your@email.com"
 
 ## Configuration
 
+The complete list of settings, with defaults and the modes they apply to, is in
+[API.md](API.md#configuration). This section covers common setups.
+
 > **Note**: Most users will use **TEDAPI** to connect to their Powerwall gateway, which is accessible at the standard IP address `192.168.91.1` on your local network. You'll need your gateway password (found in the Tesla app under your gateway settings).
 
 ### Cloud Authentication Setup (Optional, for Control Operations)
@@ -208,6 +221,9 @@ This will:
 
 ### Environment Variables
 
+Every setting, with its default and the modes it applies to, is in
+[API.md](API.md#configuration). Common examples:
+
 **Single Gateway Mode (Read-Only via TEDAPI):**
 ```bash
 PW_HOST=192.168.91.1
@@ -220,10 +236,11 @@ PROXY_BASE_URL=/pypowerwall  # Optional: serve under a sub-path (see Reverse Pro
 
 **Single Gateway Mode (TEDAPI v1r — RSA Key Auth):**
 ```bash
-PW_HOST=192.168.91.1
+PW_HOST=10.42.1.40                               # Gateway wired LAN IP (vendor subnet, or home LAN IP on some units)
 PW_GW_PWD=your_gateway_password                  # Gateway password (last 5 chars used as customer password)
 PW_RSA_KEY_PATH=/path/to/tedapi_rsa_private.pem  # RSA-4096 private key for v1r encrypted channel
-PW_WIFI_HOST=192.168.91.1                         # WiFi fallback IP for v1r mode (default: 192.168.91.1)
+PW_WIFI_HOST=192.168.91.1                         # Gateway WiFi AP: follower Powerwalls + LAN fallback (default: not set)
+PW_FAILOVER=yes                                   # "no" pins the configured transports: no WiFi/cloud fallback (default: yes)
 PW_TIMEZONE=America/Los_Angeles
 ```
 
@@ -457,10 +474,10 @@ gateways:
 
   - id: v1r-gateway
     name: TEDAPI v1r Gateway
-    host: 192.168.91.1
+    host: 10.42.1.40                            # Gateway wired LAN IP (vendor subnet, or home LAN IP on some units)
     gw_pwd: your_gateway_password                # Required even in v1r mode (used to derive customer password)
     rsa_key_path: /keys/tedapi_rsa_private.pem  # RSA-4096 private key (TEDAPI v1r mode)
-    wifi_host: 192.168.91.1                     # WiFi fallback IP (optional, defaults to 192.168.91.1)
+    wifi_host: 192.168.91.1                     # Gateway WiFi AP: follower Powerwalls + LAN fallback (not set by default)
     timezone: America/Los_Angeles
 ```
 
@@ -474,17 +491,25 @@ gateways:
 **TEDAPI connection modes:**
 - `host` + `gw_pwd` → TEDAPI (standard, uses gateway Wi-Fi password)
 - `host` + `gw_pwd` + `rsa_key_path` → TEDAPI v1r (RSA-4096 encrypted channel + customer password from gw_pwd; shown as "TEDAPI v1r" in console)
+<<<<<<< HEAD
 - `host` + `gw_pwd` + `tedapi_auth_mode: bearer` → TEDAPI over the wired LAN IP (solar-only gateways only; shown as "TEDAPI (bearer)" in console)
 - `wifi_host` → Optional WiFi fallback IP for v1r mode (default `192.168.91.1`; only needed when your gateway is on a non-standard IP)
+=======
+- `wifi_host` → the gateway's WiFi access point for v1r mode (normally `192.168.91.1`; not set by default). Needed to see follower Powerwalls, and used as the fallback if the wired LAN goes down
+>>>>>>> root/main
 
 **Optional fields:**
 - `port`: Non-standard HTTPS port (e.g. `8443`) — use when the gateway is behind a travel router that forwards a custom port to `192.168.91.1:443`
 - `type`: Gateway device type — `powerwall` (default, has batteries) or `inverter` (solar-only; suppresses battery panels in the console)
 - `rsa_key_path`: RSA-4096 private key PEM path for TEDAPI v1r LAN authentication (requires `gw_pwd` — see above)
+
 - `wifi_host`: WiFi host IP for TEDAPI v1r WiFi fallback (default `192.168.91.1`; set this when your gateway's WiFi AP is on a different subnet, e.g. behind a travel router)
 - `tedapi_auth_mode`: TEDAPI auth transport — `basic` (gateway Wi-Fi AP, default) or `bearer` (wired LAN on solar-only gateways; not PW2 or PW3). Defaults to `PW_TEDAPI_AUTH_MODE`.
 - `tedapi_api_version`: TEDAPI query set — `V2024_06` (default) or `V2026_06` (Tesla-signed queries; needs `protobuf >= 6.33.6`). Defaults to `PW_TEDAPI_API_VERSION`.
   - Precedence: per-gateway value → `PW_TEDAPI_*` environment default → library default. Unknown values log a warning and fall back (they never abort startup). pypowerwall only honours these in full TEDAPI mode (`host` + `gw_pwd`, no `password`); Basic LAN, hybrid (`gw_pwd` + `password`) and cloud gateways ignore them. `/stats` reports the requested and active values per gateway, so a request pypowerwall did not honour is visible there.
+
+- `wifi_host`: the gateway's WiFi access point for TEDAPI v1r (normally `192.168.91.1`, or the address that forwards to it, e.g. behind a travel router; not set by default). Follower Powerwalls are queried over it
+
 
 ### Reverse Proxy / HTTPS Proxy
 
@@ -668,112 +693,12 @@ For example `MQTT_CONTROLS=15` enables everything except going off grid, which n
 
 ## API Endpoints
 
-### Legacy Proxy Compatibility
+**Full reference: [API.md](API.md#routes)** lists every route with its method,
+auth requirement and response.
 
-All existing proxy endpoints work unchanged:
-
-**Core Data Endpoints:**
-- `GET /vitals` - Detailed system vitals
-- `GET /aggregates` - Power meter aggregates
-- `GET /soe` - State of energy (battery %)
-- `GET /freq` - Grid frequency data
-- `GET /pod` - Battery pod details
-- `GET /strings` - Solar string data
-- `GET /battery` - Battery information
-- `GET /json` - Combined metrics and status (JSON)
-
-**Temperature & Environment:**
-- `GET /temps` - All temperature sensors
-- `GET /temps/pw` - Powerwall temperatures only
-
-**Alerts & Status:**
-- `GET /alerts` - System alerts
-- `GET /alerts/pw` - Powerwall alerts only
-
-**Fan Information:**
-- `GET /fans` - All fan status
-- `GET /fans/pw` - Powerwall fans only (`FANn_actual`/`FANn_target` RPM; Powerwall 3 adds `FANn_duty` %, with `FANn_target` null)
-
-**Data Export:**
-- `GET /csv` - CSV format for Telegraf/InfluxDB
-- `GET /csv/v2` - Enhanced CSV format
-
-**TEDAPI Raw Access:**
-- `GET /tedapi` - TEDAPI endpoint list
-- `GET /tedapi/config` - Gateway configuration
-- `GET /tedapi/status` - System status
-- `GET /tedapi/components` - Component details
-- `GET /tedapi/battery` - Battery information
-- `GET /tedapi/controller` - Controller data
-
-**Tesla API Endpoints:**
-- `GET /api/system_status/soe` - State of energy
-- `GET /api/system_status/grid_status` - Grid connection status
-- `GET /api/system_status/grid_faults` - Grid fault log
-- `GET /api/sitemaster` - Sitemaster information
-- `GET /api/meters/aggregates` - Power meters
-- `GET /api/status` - System status
-- `GET /api/site_info` - Site information
-- `GET /api/site_info/site_name` - Site name
-- `GET /api/customer/registration` - Customer registration info
-- `GET /api/troubleshooting/problems` - Problem list
-- `GET /api/auth/toggle/supported` - Auth toggle support
-- `GET /api/networks` - Network configuration
-- `GET /api/system/networks` - System networks
-- `GET /api/powerwalls` - Powerwall device list
-
-**Server Status:**
-- `GET /version` - Server and firmware versions
-- `GET /stats` - Server statistics (uptime, requests, errors)
-
-**Control Operations (requires authentication):**
-- `GET /control/status` - Control availability for the Console (`{"enabled": bool}`, unauthenticated)
-- `POST /control/{path}` - Control operations (reserve, mode, etc.)
-
-**Tesla Tariff (server-only, not in the pypowerwall proxy):**
-- `GET /api/tesla/tariff_rate` - The site's utility tariff from the Tesla cloud
-  (`code`, `name`, `utility`, `seasons`, `energy_charges`, ...). Cached for 5
-  minutes; if a refresh fails, the last good tariff is served.
-- `POST /api/tesla/time_of_use_settings` - Update the Time-of-Use tariff
-  (requires `Authorization: Bearer <PW_CONTROL_SECRET>`). Body:
-  `{"tou_settings": {"optimization_strategy": "economics", "tariff_content_v2": {...}}}`.
-  Only `tou_settings` is sent to Tesla. `tariff_content_v2` uses Tesla's v2
-  tariff schema, which differs from what the GET returns, so a read result
-  can't be posted back unchanged. Returns e.g. `{"Message": "Updated", "Code": 201}`.
-
-Both need a Tesla cloud connection: hybrid mode (a local gateway with
-`PW_EMAIL` cloud control), or a cloud or FleetAPI gateway. Otherwise they
-return `503`; a Tesla-side error returns `502`, and an invalid POST body `400`.
-
-### Multi-Gateway Endpoints
-
-**Gateway Selection:**
-- `GET /api/gateways` - List all configured gateways
-- `GET /api/gateways/{id}` - Gateway details
-- `GET /api/gateways/{id}/vitals` - Gateway-specific vitals
-- `GET /api/gateways/{id}/aggregates` - Gateway-specific power data
-
-**Aggregated Data:**
-- `GET /api/aggregate/power` - Combined power across all gateways
-- `GET /api/aggregate/soe` - Total battery capacity and charge
-- `GET /api/aggregate/status` - Health status of all gateways
-
-**Time-Series Endpoints (Daily Energy, Temperatures, Fans):**
-- `GET /api/timeseries/today` - Today's running kWh totals per gateway
-- `GET /api/timeseries/daily?days=7` - Daily kWh totals (per gateway/category); `start`/`end` (`YYYY-MM-DD`) select any range of local days instead, e.g. `?start=2026-01-01&end=2026-06-30`
-- `GET /api/timeseries/trend?hours=24` - Bucketed kW + battery level for charting (per-gateway mean, summed across gateways)
-- `GET /api/timeseries/samples` - Raw samples (troubleshooting; filters: `gateway`, `start`, `end`, `limit`) — includes battery level (`soe`)
-- `GET /api/timeseries/status` - Subsystem status, retention settings, DB size
-- `GET /api/timeseries/signals` - Recorded temperature/fan series per gateway and device (each with its `powerwall` label, e.g. `PW1` / `PW1 Exp 1`, and the time range it covers), plus the `metrics` / `groups` catalog and gateway names
-- `GET /api/timeseries/signal_trend` - Temperature/fan history for charting, with avg/min/max and sample count per point (filters: `metrics`, `gateway`, `devices`, `start`, `end`, `hours`; `resolution=auto|raw|daily`; `raw` is served as daily beyond 14 days or ~500k rows)
-
-On `/signal_trend`, `start` / `end` are epoch seconds between 0 and 4102444800 (2100-01-01); other values return 422. `/trend` rejects only non-finite values (`nan`, `inf`).
-
-All report `{"enabled": false, ...}` when disabled (`PW_TIMESERIES_RETENTION=-1`).
-
-**WebSocket Endpoints:**
-- `WS /ws/gateway/{id}` - Real-time data stream for specific gateway
-- `WS /ws/aggregate` - Real-time aggregated data stream
+All existing pypowerwall proxy endpoints work unchanged, alongside multi-gateway
+(`/api/gateways/*`), aggregate (`/api/aggregate/*`), time-series
+(`/api/timeseries/*`) and WebSocket (`/ws/*`) endpoints.
 
 ### Interactive API Documentation
 

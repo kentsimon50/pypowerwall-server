@@ -363,6 +363,109 @@ async def test_rsa_key_path_passed_to_powerwall_constructor(monkeypatch, mock_py
     call_kwargs = powerwall_spy.call_args.kwargs
     assert call_kwargs.get("rsa_key_path") == "/keys/tedapi_rsa_private.pem"
     assert call_kwargs.get("host") == "192.168.91.1"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failover", [True, False])
+async def test_failover_setting_passed_to_powerwall_constructor(
+    monkeypatch, mock_pypowerwall, failover
+):
+    """PW_FAILOVER reaches pypowerwall.Powerwall(failover=...) (pypowerwall#402).
+
+    Unwired, PW_FAILOVER=no would be silently ignored and the library would keep
+    rerouting to WiFi or cloud.
+    """
+    from unittest.mock import Mock
+    from app.config import GatewayConfig, settings
+    from app.models.gateway import Gateway, GatewayStatus
+    import pypowerwall
+
+    powerwall_spy = Mock(return_value=mock_pypowerwall)
+    monkeypatch.setattr(pypowerwall, "Powerwall", powerwall_spy)
+    monkeypatch.setattr(settings, "failover", failover)
+
+    gw = Gateway(id="fo", name="TEDAPI", host="10.42.1.40", gw_pwd="pw")
+    config = GatewayConfig(id="fo", name="TEDAPI", host="10.42.1.40", gw_pwd="pw")
+    gateway_manager.gateways["fo"] = gw
+    gateway_manager._pending_configs["fo"] = config
+    gateway_manager.cache["fo"] = GatewayStatus(gateway=gw, online=False)
+    gateway_manager._consecutive_failures["fo"] = 0
+    gateway_manager._next_poll_time["fo"] = 0
+
+    await gateway_manager._poll_gateway("fo")
+
+    assert powerwall_spy.called, "pypowerwall.Powerwall() was never called"
+    assert powerwall_spy.call_args.kwargs.get("failover") is failover
+
+
+@pytest.mark.parametrize("failover", [True, False])
+def test_stats_config_reports_failover(client, monkeypatch, failover):
+    """/stats config reports PW_FAILOVER, as the proxy's /stats does."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "failover", failover)
+    response = client.get("/stats")
+    assert response.status_code == 200
+    assert response.json()["config"]["PW_FAILOVER"] is failover
+
+
+@pytest.mark.parametrize("neg_solar", [True, False])
+def test_stats_config_reports_neg_solar(client, monkeypatch, neg_solar):
+    """/stats config reports the PW_NEG_SOLAR setting, not a fixed value."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "neg_solar", neg_solar)
+    response = client.get("/stats")
+    assert response.status_code == 200
+    assert response.json()["config"]["PW_NEG_SOLAR"] is neg_solar
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fleetapi", [False, True], ids=["cloud", "fleetapi"])
+@pytest.mark.parametrize(
+    "siteid, expected", [("123", 123), ("abc", "abc"), (None, None)]
+)
+async def test_siteid_passed_to_cloud_powerwall_constructor(
+    monkeypatch, mock_pypowerwall, fleetapi, siteid, expected
+):
+    """PW_SITEID reaches Cloud and FleetAPI connections, as an integer when
+    numeric (the cloud clients compare it with integer site ids)."""
+    from unittest.mock import Mock
+    from app.config import GatewayConfig, settings
+    from app.models.gateway import Gateway, GatewayStatus
+    import pypowerwall
+
+    powerwall_spy = Mock(return_value=mock_pypowerwall)
+    monkeypatch.setattr(pypowerwall, "Powerwall", powerwall_spy)
+    monkeypatch.setattr(settings, "siteid", siteid)
+
+    kwargs = dict(
+        id="cl", name="Cloud", email="a@b.c", cloud_mode=True, fleetapi=fleetapi
+    )
+    gw = Gateway(**kwargs)
+    gateway_manager.gateways["cl"] = gw
+    gateway_manager._pending_configs["cl"] = GatewayConfig(**kwargs)
+    gateway_manager.cache["cl"] = GatewayStatus(gateway=gw, online=False)
+    gateway_manager._consecutive_failures["cl"] = 0
+    gateway_manager._next_poll_time["cl"] = 0
+
+    await gateway_manager._poll_gateway("cl")
+
+    assert powerwall_spy.called, "pypowerwall.Powerwall() was never called"
+    call_kwargs = powerwall_spy.call_args.kwargs
+    assert call_kwargs.get("cloudmode") is True
+    assert call_kwargs.get("fleetapi") is fleetapi
+    assert call_kwargs.get("siteid") == expected
+    assert ("siteid" in call_kwargs) is (siteid is not None)
+
+
+def test_failover_setting_defaults_on_and_parses_no(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.delenv("PW_FAILOVER", raising=False)
+    assert Settings().failover is True
+    monkeypatch.setenv("PW_FAILOVER", "no")
+    assert Settings().failover is False
+
+
 # ---------------------------------------------------------------------------
 # Multi-PW snapshot guard — config convergence & staleness cap
 # ---------------------------------------------------------------------------
@@ -689,6 +792,8 @@ async def test_initialize_creates_cloud_control(monkeypatch):
     gm.cache.clear()
     gm._cloud_control = None
 
+    from app.config import settings as _cfg
+    monkeypatch.setattr(_cfg, "control_secret", "test-secret")  # hybrid needs it (or PW_CLOUD_HYBRID)
     await gm.initialize(configs, poll_interval=5)
 
     # Cloud control connects in the background so startup isn't blocked
@@ -732,6 +837,8 @@ async def test_initialize_creates_cloud_control_for_basic_lan(monkeypatch):
     gm.cache.clear()
     gm._cloud_control = None
 
+    from app.config import settings as _cfg
+    monkeypatch.setattr(_cfg, "control_secret", "test-secret")  # hybrid needs it (or PW_CLOUD_HYBRID)
     await gm.initialize(configs, poll_interval=5)
 
     assert gm._cloud_control_task is not None
@@ -807,6 +914,8 @@ async def test_initialize_cloud_control_uses_pw_authpath_fallback(monkeypatch):
     gm.cache.clear()
     gm._cloud_control = None
 
+    from app.config import settings as _cfg
+    monkeypatch.setattr(_cfg, "control_secret", "test-secret")  # hybrid needs it (or PW_CLOUD_HYBRID)
     await gm.initialize(configs, poll_interval=5)
     await gm._cloud_control_task
 
@@ -819,8 +928,8 @@ async def test_initialize_cloud_control_uses_pw_authpath_fallback(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_initialize_cloud_control_exception_is_handled(monkeypatch):
-    """Test that initialize() logs a warning and continues when cloud control setup fails."""
+async def test_initialize_cloud_control_exception_is_retried(monkeypatch):
+    """Test that a failed cloud-control init is retried, and shutdown stops it."""
     from app.config import GatewayConfig
 
     call_count = 0
@@ -849,13 +958,23 @@ async def test_initialize_cloud_control_exception_is_handled(monkeypatch):
     gm.cache.clear()
     gm._cloud_control = None
 
-    # Should not raise — exception is swallowed with a warning
+    # Should not raise — the failure is logged and retried in the background
+    from app.config import settings as _cfg
+    monkeypatch.setattr(_cfg, "control_secret", "test-secret")  # hybrid needs it (or PW_CLOUD_HYBRID)
     await gm.initialize(configs, poll_interval=5)
-    await gm._cloud_control_task
+    task = gm._cloud_control_task
+    assert task is not None
 
+    deadline = asyncio.get_running_loop().time() + 5
+    while call_count < 1 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert call_count >= 1
     assert gm._cloud_control is None
+    assert not task.done()  # now waiting out the retry backoff
 
     await gm.shutdown()
+    assert task.done()
 
 
 # --- Firmware change logging (Powerwall-Dashboard #854) ---
@@ -1179,3 +1298,44 @@ async def test_cloud_control_local_fallback_skips_stub_grid_getters(
         assert status.data.grid_export is None
     finally:
         mock_gateway_manager._cloud_control = None
+
+
+# PW_CLOUD_HYBRID: the hybrid cloud login starts only when it is wanted
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret, hybrid, expected", [
+    (None, False, False),          # PW_EMAIL alone: no cloud login (proxy parity)
+    ("test-secret", False, True),  # control needs the cloud link
+    (None, True, True),            # read-only cloud values
+])
+async def test_hybrid_cloud_login_needs_control_secret_or_opt_in(monkeypatch, caplog, secret, hybrid, expected):
+    from app.config import GatewayConfig, settings
+
+    monkeypatch.setattr(settings, "control_secret", secret)
+    monkeypatch.setattr(settings, "cloud_hybrid", hybrid)
+    import pypowerwall
+    monkeypatch.setattr(pypowerwall, "Powerwall", lambda **kw: _make_realistic_pw_mock())
+
+    gm = gateway_manager
+    gm.gateways.clear()
+    gm.connections.clear()
+    gm.cache.clear()
+    gm._cloud_control = None
+    gm._cloud_control_task = None
+    configs = [GatewayConfig(id="home", name="Home", host="10.0.1.2", password="pw", email="user@example.com")]
+
+    with caplog.at_level("INFO"):
+        await gm.initialize(configs, poll_interval=5)
+    try:
+        assert (gm._cloud_control_task is not None) is expected
+        assert gm._cloud_control_configured is expected
+        assert ("Hybrid cloud connection off" in caplog.text) is (not expected)
+    finally:
+        await gm.shutdown()
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_stats_config_reports_cloud_hybrid(client, monkeypatch, value):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "cloud_hybrid", value)
+    assert client.get("/stats").json()["config"]["PW_CLOUD_HYBRID"] is value
