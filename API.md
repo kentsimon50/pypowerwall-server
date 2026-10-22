@@ -19,7 +19,7 @@ and `/redoc`.
 Settings come from environment variables. Names are case-insensitive, except
 `PW_CONFIG` and `PW_GATEWAYS`, which must be uppercase. Command
 line flags (`pypowerwall-server --help`) override the matching variables.
-Booleans accept `yes`/`no`, `true`/`false`, `1`/`0` or `on`/`off`. For boolean
+Booleans accept `yes`/`no`, `true`/`false`, `t`/`f`, `1`/`0` or `on`/`off`, and integers also take a whole-number decimal such as `8675.0`. For boolean
 and integer settings, surrounding spaces and an inline ` # comment` are ignored,
 an empty value means the default, and an unrecognized value logs a warning and
 uses the default, so a proxy `pypowerwall.env` can't stop the server from
@@ -42,7 +42,7 @@ The mode is chosen per gateway from the settings it has:
 | TEDAPI | `PW_HOST` + `PW_GW_PWD` | Local data over the gateway WiFi (normally `192.168.91.1`). Read-only unless hybrid. |
 | TEDAPI v1r | `PW_HOST` + `PW_GW_PWD` + `PW_RSA_KEY_PATH` | Local data over the wired LAN with a registered RSA key. Can write settings and island locally. |
 | Local | `PW_HOST` + `PW_PASSWORD`, no gateway password or RSA key | Powerwall 2 local API, like the proxy's local mode. Detected on connect: the gateway answers `/api/status`. |
-| Basic LAN | `PW_HOST` + `PW_PASSWORD`, no gateway password or RSA key | Powerwall 3 wired LAN, detected on connect when `/api/status` isn't served. Core metrics only: aggregates, battery level, grid status. |
+| Basic LAN | `PW_HOST` + `PW_PASSWORD`, no gateway password or RSA key | Powerwall 3 wired LAN, detected on connect when `/api/status` isn't served (re-checked after 5 minutes, then doubling up to 6 hours). Core metrics only: aggregates, battery level, grid status. |
 | Cloud | `PW_EMAIL` without `PW_HOST`, or `.pypowerwall.auth` in `PW_AUTH_PATH` (its account fills a missing `PW_EMAIL`) | Tesla cloud. Run `pypowerwall-server --setup` once to create the auth files. |
 | FleetAPI | `.pypowerwall.fleetapi` in `PW_AUTH_PATH` without `PW_HOST` (picked before Cloud, as the proxy does), or `fleetapi: true` on a gateway in `PW_GATEWAYS` or the config file | Tesla Fleet API. |
 | Hybrid | Any local mode plus `PW_EMAIL`, and `PW_CONTROL_SECRET` or `PW_CLOUD_HYBRID=yes` | Reads stay local; control writes use a Tesla cloud connection, which also fills values the local API lacks (Basic LAN mode and reserve, grid charging/export settings). |
@@ -133,7 +133,7 @@ PW_GATEWAYS='[
 
 | Variable | Default | Applies to | Proxy | Description |
 |----------|---------|------------|:-----:|-------------|
-| `PW_CONTROL_SECRET` | none | All | ✓ | Enables all write routes; clients send it as the control token (see [Control and security](#control-and-security)). Unset means read-only. The proxy uses the same variable but a different request format. |
+| `PW_CONTROL_SECRET` | none | All | ✓ | Enables all write routes; clients send it as the control token (see [Control and security](#control-and-security)). Unset means read-only. The proxy's form-encoded `token` requests work too. |
 | `PW_ISLANDING_COOLDOWN` | `30` | v1r | | Minimum seconds between islanding commands per gateway; `0` disables the cooldown. |
 | `PW_CLOUD_HYBRID` | `no` | Local with `PW_EMAIL` | | `yes` starts the hybrid cloud connection without `PW_CONTROL_SECRET`, for its read-only values (Basic LAN mode and reserve, grid charging/export settings). With `PW_CONTROL_SECRET` set it starts anyway. Like the proxy, `PW_EMAIL` alone doesn't start it. |
 | `PW_LOCAL_FIRST` | `no` | v1r, Hybrid | | `yes` sends reserve, mode and grid writes over a confirmed local v1r connection first, even when a hybrid cloud connection exists (see [write path](#post-controlpath)). |
@@ -213,7 +213,7 @@ clients share the proxy's IP.
 
 These proxy variables are accepted (and some echoed in `/stats`) so an existing
 proxy environment starts cleanly, but they change nothing in the server:
-`PW_BROWSER_CACHE` (default `0`), `PW_HTTPS` (`no`; the proxy's `http` is accepted), `PW_AUTH_MODE` (`cookie`),
+`PW_BROWSER_CACHE` (default `0`), `PW_HTTPS` (`no`; the proxy's `http` is accepted and reads as `no`, since the server always serves plain HTTP), `PW_AUTH_MODE` (`cookie`),
 `PW_SUPPRESS_NETWORK_ERRORS` (`no`), `PW_NETWORK_ERROR_RATE_LIMIT` (`5`),
 `PW_FAIL_FAST` (`no`) and `PW_HEALTH_CHECK` (`yes`).
 
@@ -334,7 +334,12 @@ for the request format and write path.
 | Method | Path | Auth | Response |
 |--------|------|------|----------|
 | GET | `/control/status` | | `{"enabled"}`: whether `PW_CONTROL_SECRET` is set. |
-| POST | `/control/{path}` | token | Set `reserve`, `mode`, `grid_charging`, `grid_export` or `reserve_hold`; returns the library result. |
+| GET | `/control/reserve` | | `{"reserve"}`, as in the proxy. Error when control is off. |
+| GET | `/control/mode` | | `{"mode"}` (`"unknown"` when not known), as in the proxy. |
+| GET | `/control/grid_charging` | | `{"grid_charging": true \| false}`, as in the proxy. |
+| GET | `/control/grid_export` | | `{"grid_export"}` (`"unknown"` when not known), as in the proxy. |
+| GET | `/control/max_backup` | | Current backup events (TEDAPI v1r), as in the proxy, cached 30 seconds. With a valid token (the `Authorization` header, preferred, or `?token=`, which can end up in access logs), an expired manual backup event is cancelled, decided on fresh data. |
+| POST | `/control/{path}` | token | Set `reserve`, `mode`, `grid_charging`, `grid_export`, `reserve_hold` or `max_backup`; returns the library result. Also takes the proxy's form-encoded requests (below). |
 | POST | `/control/islanding` | token | Go off grid or reconnect (TEDAPI v1r only). |
 | GET | `/api/tesla/tariff_rate` | | The site's Tesla tariff from the cloud. Cached 5 minutes; the last good value is served if a refresh fails. |
 | POST | `/api/tesla/time_of_use_settings` | token | Update the Time-of-Use tariff. Body `{"tou_settings": {..., "tariff_content_v2": {...}}}`; only `tou_settings` is sent to Tesla. |
@@ -343,8 +348,10 @@ The tariff routes need a Tesla cloud connection (hybrid, Cloud or FleetAPI):
 otherwise `503`; a Tesla error is `502`. `tariff_content_v2` uses Tesla's v2
 tariff schema, which differs from what the GET returns, so a read result can't
 be posted back unchanged. Current settings are read with
-`/api/operation`, `/pw/get_reserve` and `/pw/get_mode`; the proxy's
-`GET /control/<name>` reads and `max_backup` are not available.
+`/api/operation`, `/pw/get_reserve`, `/pw/get_mode` or the proxy's
+`GET /control/<name>` routes. Those come from the poll cache; like the proxy,
+they need control enabled but no token, and like the proxy they always answer
+HTTP `200`, with an `{"error": ...}` body when they can't.
 
 ### Gateways (multi-gateway)
 
@@ -457,7 +464,19 @@ curl -X POST http://localhost:8675/control/reserve \
   -d '{"value": 20}'
 ```
 
-This differs from the proxy, which takes a form-encoded `token` parameter.
+**Proxy format.** A form-encoded POST, as the proxy takes it, also works:
+
+```bash
+curl -X POST -d "value=20&token=$PW_CONTROL_SECRET" http://localhost:8675/control/reserve
+```
+
+The `token` field (or the `Authorization` header) carries the secret, `value`
+the new setting, and the optional `mode`/`level` companions work as above. An
+empty `value` returns the current setting. The same validation and write path
+apply, and responses use the proxy's shape: `{"error": ...}` with `400`,
+`{"unauthorized": ...}` with `401`, `{"grid_charging"|"grid_export": "Set
+Successfully"}` and otherwise the library result. As in the proxy, a body
+sent without a `Content-Type` is read as a form unless it's JSON.
 
 ### `POST /control/{path}`
 
@@ -468,6 +487,7 @@ This differs from the proxy, which takes a form-encoded `token` parameter.
 | `grid_charging` | `{"value": true \| false}` | Must be a JSON boolean. |
 | `grid_export` | `{"value": "battery_ok" \| "pv_only" \| "never"}` | |
 | `reserve_hold` | `{}` | Sets the reserve to the current battery level (rounded down). `503` if the level is unknown. |
+| `max_backup` | `{"value": seconds \| "cancel"}` | Schedules (60 to 4294967295 seconds, the gateway's range) or cancels a manual backup event (storm watch). Needs the TEDAPI v1r transport, else `503`. |
 
 Any other `path` is sent as a raw POST of the body to the default gateway's
 `/api/{path}`.
@@ -482,7 +502,7 @@ With `PW_LOCAL_FIRST=yes`, a gateway confirmed on TEDAPI v1r, with its wired LAN
 up and a local connection, writes over that local connection first, even when
 a hybrid cloud connection exists. A write that was sent is final: there's no
 second attempt through the cloud, even after a timeout, since it may already
-have been applied. When the LAN is down or there's no local connection, the
+have been applied. When the LAN is down (the library's LAN failover tripped, or the last poll failed) or there's no local connection, the
 path above applies. Islanding is unaffected.
 
 ### Islanding: `POST /control/islanding`
@@ -549,7 +569,7 @@ default instead: `{}`, `[]`, an object with `null` values, or zeros for
 | Unknown `gateway_id` | `404` on `/api/gateways/{gateway_id}...`. |
 | `/tedapi/*` offline or unsupported | `200` with `{"error": "..."}`. |
 | On-demand raw gateway calls fail | `503`. |
-| Control disabled | `403` `{"detail": "Control features not enabled"}`. |
+| Control disabled | `403` `{"detail": "Control features not enabled"}`. The proxy-format routes answer `{"error": "Control Commands Disabled - Set PW_CONTROL_SECRET to enable"}` instead: `400` for a form POST, `200` for a `GET /control/<name>`, as in the proxy. |
 | Missing or wrong token | `401`. |
 | Invalid control value | `400` with the reason in `detail`. |
 | Body not a JSON object, or bad query value | `422`. |

@@ -49,7 +49,8 @@ Error Handling:
 
 Thread Safety:
     - All operations use asyncio (no threads/locks needed for reads)
-    - Write operations serialized via _write_lock to prevent set_operation() races
+    - Write operations serialized via _write_lock (held until the library call
+      finishes, even past a timeout) to prevent set_operation() races
     - Single event loop handles all concurrency
     - Background task coordinated via asyncio.create_task()
     - Graceful shutdown via task cancellation
@@ -67,16 +68,18 @@ import math
 import os
 import time
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 import pypowerwall
 from pypowerwall.tedapi.api_version import TEDAPIApiVersion
 from pypowerwall.tedapi.auth_mode import AuthMode
+from pypowerwall.tedapi import GW_IP as TEDAPI_GW_IP
 from app.models.gateway import Gateway, GatewayStatus, PowerwallData, AggregateData
 from app.core.scaling import raw_to_tesla_battery_percent
 from app.config import GatewayConfig
+from app.utils.control import is_v1r_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,8 @@ _WRITE_METHODS = frozenset(
         "go_off_grid",
         "reconnect_grid",
         "set_tariff",
+        "schedule_max_backup",
+        "cancel_max_backup",
         # Raw POST is the control fallback for v1r/cloud-mode/FleetAPI
         # gateways (e.g. post("/api/operation", ...)). It targets the same
         # Tesla site as the set_* methods, so it must hold the same lock or
@@ -244,6 +249,10 @@ def _protobuf_version() -> Optional["tuple[int, ...]"]:
 
 
 _ISLANDING_METHODS = frozenset({"go_off_grid", "reconnect_grid"})
+# Reads that take the write lock: the backup-events read must wait for a
+# timed-out schedule or cancel that is still running, or a cleanup could
+# decide on stale events and cancel the event that just got scheduled.
+_LOCKED_READS = frozenset({"get_backup_events"})
 
 
 # pypowerwall client modes whose top-level get_grid_charging()/get_grid_export()
@@ -326,6 +335,35 @@ class IslandingCooldownError(RuntimeError):
         self.retry_after = retry_after
 
 
+def _effective_host(config: GatewayConfig) -> Optional[str]:
+    """The host pypowerwall connects to: with a non-standard port appended
+    (e.g. host="192.168.1.50", port=8443 -> "192.168.1.50:8443")."""
+    return f"{config.host}:{config.port}" if config.port else config.host
+
+
+def _expects_tedapi(config: GatewayConfig, default_password: Optional[str]) -> bool:
+    """Whether pypowerwall will run TEDAPI for a local configuration: an RSA key
+    (v1r) or a gateway password without a customer password (full TEDAPI) at
+    any host; with both passwords (hybrid) only at the gateway's WiFi address,
+    the one place pypowerwall's local client starts TEDAPI."""
+    if not config.host or config.cloud_mode or config.fleetapi:
+        return False
+    if config.rsa_key_path:
+        return True
+    if not config.gw_pwd:
+        return False
+    if not (config.password or default_password):
+        return True
+    return _effective_host(config) in (TEDAPI_GW_IP, f"{TEDAPI_GW_IP}:443")
+
+
+def _siteid_kwarg(siteid) -> Any:
+    """PW_SITEID for pypowerwall: the cloud client compares it with integer
+    site ids, so a numeric value is passed as an int."""
+    text = str(siteid).strip()
+    return int(text) if text.isdigit() else text
+
+
 def _connection_mode_label(pw, basic_lan: bool) -> Optional[str]:
     """The connection pypowerwall is using now, which failover can change
     (FleetAPI -> Cloud, local -> Cloud); None when the client doesn't say."""
@@ -364,9 +402,12 @@ class GatewayManager:
     # this often, and retry a failed fetch no sooner than _SITE_INFO_RETRY
     _SITE_INFO_REFRESH = 300
     _SITE_INFO_RETRY = 60
-    # Basic LAN detected on connect is provisional: re-check /api/status this
-    # often so a Powerwall 2 whose status probe failed once gets full polling
+    # Basic LAN detected on connect is provisional: re-check /api/status so a
+    # Powerwall 2 whose status probe failed once gets full polling. A real PW3
+    # answers 404 (pypowerwall logs it), so the interval doubles after each
+    # failed check, from 5 minutes up to 6 hours.
     _BASIC_LAN_RECHECK = 300
+    _BASIC_LAN_RECHECK_MAX = 6 * 3600
 
     def __init__(self):
         self.gateways: Dict[str, Gateway] = {}
@@ -450,8 +491,8 @@ class GatewayManager:
         # Last good /api/site_info per gateway, and (monotonic time, succeeded) of the last fetch
         self._site_info: Dict[str, Dict[str, Any]] = {}
         self._site_info_attempt: Dict[str, Tuple[float, bool]] = {}
-        # Monotonic time of the last /api/status check per Basic LAN gateway
-        self._basic_lan_checked: Dict[str, float] = {}
+        # Basic LAN /api/status re-check per gateway: (monotonic due time, interval)
+        self._basic_lan_recheck: Dict[str, Tuple[float, float]] = {}
 
         # Cloud connection for control operations (set_reserve, set_mode).
         # TEDAPI doesn't support POST/write APIs, so a separate cloud-mode
@@ -716,6 +757,7 @@ class GatewayManager:
                     email=config.email,
                     timezone=config.timezone,
                     basic_lan=basic_lan,
+                    tedapi_expected=_expects_tedapi(config, settings.pw_password),
                     cloud_mode=config.cloud_mode,
                     fleetapi=config.fleetapi,
                     type=config.type,
@@ -817,7 +859,7 @@ class GatewayManager:
                     gw.host
                     and not gw.cloud_mode
                     and not gw.fleetapi
-                    and (gw.gw_pwd or gw.rsa_key_configured)
+                    and gw.tedapi_expected
                 ):
                     self._fallback_state[gateway_id] = self._new_fallback_state()
                     self._tedapi_probe_failures[gateway_id] = 0
@@ -874,10 +916,7 @@ class GatewayManager:
                     if settings.siteid:
                         # PW_SITEID picks the site on multi-site accounts. The
                         # cloud client compares it with integer site ids.
-                        siteid = str(settings.siteid).strip()
-                        cloud_kwargs["siteid"] = (
-                            int(siteid) if siteid.isdigit() else siteid
-                        )
+                        cloud_kwargs["siteid"] = _siteid_kwarg(settings.siteid)
                     pw = await asyncio.wait_for(
                         loop.run_in_executor(
                             self._executor,
@@ -908,11 +947,12 @@ class GatewayManager:
                     return  # Only need one cloud control connection
                 except Exception as e:
                     logger.warning(
-                        "Cloud control connection failed "
-                        "(will retry in %.0fs): %s",
-                        retry_interval,
-                        e,
+                        "Cloud control connection failed for %s: %s", config.id, e
                     )
+            logger.warning(
+                "Cloud control connection not established; retrying in %.0fs",
+                retry_interval,
+            )
             await asyncio.sleep(retry_interval)
             retry_interval = min(
                 retry_interval * 2, self._CLOUD_CONTROL_RETRY_MAX
@@ -1089,9 +1129,10 @@ class GatewayManager:
         # Powerwall 2 can also hit transiently. Re-check now and then: once
         # the gateway answers, it gets the full local API from then on.
         now = time.monotonic()
-        checked = self._basic_lan_checked.setdefault(gateway_id, now)  # clock starts at the first poll
-        if basic_lan and now - checked >= self._BASIC_LAN_RECHECK:
-            self._basic_lan_checked[gateway_id] = now
+        due, interval = self._basic_lan_recheck.setdefault(
+            gateway_id, (now + self._BASIC_LAN_RECHECK, self._BASIC_LAN_RECHECK)
+        )  # the clock starts at the first poll
+        if basic_lan and now >= due:
             try:
                 full_api = await asyncio.wait_for(
                     loop.run_in_executor(self._executor, pw.is_connected),
@@ -1099,6 +1140,8 @@ class GatewayManager:
                 )
             except (asyncio.TimeoutError, Exception):
                 full_api = False
+            interval = min(interval * 2, self._BASIC_LAN_RECHECK_MAX)
+            self._basic_lan_recheck[gateway_id] = (now + interval, interval)
             if full_api is True:
                 gateway.basic_lan = basic_lan = False
                 logger.info(
@@ -1657,10 +1700,7 @@ class GatewayManager:
                         if settings.siteid:
                             # PW_SITEID picks the site on multi-site accounts.
                             # The cloud client compares it with integer ids.
-                            siteid = str(settings.siteid).strip()
-                            cloud_kwargs["siteid"] = (
-                                int(siteid) if siteid.isdigit() else siteid
-                            )
+                            cloud_kwargs["siteid"] = _siteid_kwarg(settings.siteid)
                         pw = await asyncio.wait_for(
                             loop.run_in_executor(
                                 self._executor,
@@ -1771,6 +1811,10 @@ class GatewayManager:
                         mode_label = "Basic LAN"
                     else:
                         mode_label = "Local"
+                    # Failover can land elsewhere (e.g. local -> Cloud): say so
+                    live = _connection_mode_label(pw, gateway.basic_lan)
+                    if live and not mode_label.startswith(live):
+                        mode_label = f"{live} (configured {mode_label})"
 
                     if gateway.cloud_mode or gateway.fleetapi:
                         try:
@@ -1903,10 +1947,10 @@ class GatewayManager:
                 gateway=gateway, data=data, online=True, last_updated=data.timestamp
             )
 
-            # Persist the sample for daily energy statistics (never raises;
-            # no-op when the store is disabled).
-            await self._record_timeseries_sample(gateway_id, gateway, data)
-            await self._record_signal_sample(gateway_id, gateway, data)
+            # Queue the sample for daily energy statistics (never raises or
+            # waits; no-op when the store is disabled).
+            self._record_timeseries_sample(gateway_id, gateway, data)
+            self._record_signal_sample(gateway_id, gateway, data)
 
             # Publish to MQTT after the cache is updated (never raises here).
             self._schedule_mqtt_publish(gateway_id)
@@ -1957,17 +2001,16 @@ class GatewayManager:
             # Publish the offline status to MQTT so HA reflects gateway going offline.
             self._schedule_mqtt_publish(gateway_id)
 
-    async def _record_timeseries_sample(
+    def _record_timeseries_sample(
         self, gateway_id: str, gateway, data: PowerwallData
     ) -> None:
-        """Feed one poll result into the TimeSeriesStore.
+        """Queue one poll result for the TimeSeriesStore.
 
-        Runs after the cache update on every successful poll cycle. Storage
-        failures are logged and swallowed — statistics must never break
-        polling. Samples are awaited (not fire-and-forget) so each gateway's
-        samples stay strictly ordered for trapezoidal integration. The
-        timeout bounds how long polling waits; the store retains accepted
-        writes and shields them from cancellation until they finish.
+        Runs after the cache update on every successful poll cycle and never
+        waits for the write: a stalled disk must not hold up polling or MQTT
+        (DESIGN.md §6). The store runs writes in FIFO order, so each
+        gateway's samples stay ordered for trapezoidal integration, bounds
+        its backlog, and logs storage failures.
         """
         try:
             aggregates = data.aggregates or {}
@@ -1982,39 +2025,29 @@ class GatewayManager:
                 ts = datetime.now().timestamp()
             from app.core.timeseries import get_timeseries_store
 
-            await asyncio.wait_for(
-                get_timeseries_store().record_sample(
-                    gateway_id=gateway_id,
-                    ts=ts,
-                    solar_w=solar,
-                    home_w=load,
-                    battery_w=battery,
-                    site_w=site,
-                    soe=data.soe,
-                    timezone=gateway.timezone,
-                ),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Time-series sample write timed out for %s — "
-                "accepted write remains queued; polling continues",
-                gateway_id,
+            get_timeseries_store().submit_sample(
+                gateway_id=gateway_id,
+                ts=ts,
+                solar_w=solar,
+                home_w=load,
+                battery_w=battery,
+                site_w=site,
+                soe=data.soe,
+                timezone=gateway.timezone,
             )
         except Exception as e:
             logger.debug(f"Time-series sample recording failed for {gateway_id}: {e}")
 
-    async def _record_signal_sample(
+    def _record_signal_sample(
         self, gateway_id: str, gateway: Gateway, data: PowerwallData
     ) -> None:
-        """Feed this poll's Powerwall temperatures and fan readings into the
+        """Queue this poll's Powerwall temperatures and fan readings for the
         TimeSeriesStore.
 
         Signals come from the vitals and fan_speeds already fetched this
         cycle (no extra gateway calls). The store keeps at most one snapshot
-        per PW_TIMESERIES_SIGNAL_INTERVAL, so most calls return immediately.
-        Like power samples, failures are logged and swallowed. The timeout
-        bounds the polling wait without cancelling accepted store writes.
+        per PW_TIMESERIES_SIGNAL_INTERVAL, so most calls queue nothing. Like
+        power samples, the write isn't awaited and failures are logged.
 
         Args:
             gateway_id: Gateway identifier.
@@ -2039,17 +2072,8 @@ class GatewayManager:
             ts = data.timestamp
             if ts is None or ts < 1e9:
                 ts = datetime.now().timestamp()
-            await asyncio.wait_for(
-                store.record_signal_sample(
-                    gateway_id, ts, metrics, timezone=gateway.timezone
-                ),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Device signal write timed out for %s — "
-                "accepted write remains queued; polling continues",
-                gateway_id,
+            store.submit_signal_sample(
+                gateway_id, ts, metrics, timezone=gateway.timezone
             )
         except Exception as e:
             logger.debug(f"Device signal recording failed for {gateway_id}: {e}")
@@ -2180,11 +2204,7 @@ class GatewayManager:
         # with the library default of 5s, a cycle that takes longer
         # re-fetches mid-cycle data it already has.
         pwcacheexpire = max(5, int(self._poll_interval))
-        # Build host string with optional non-standard port
-        # e.g. host="192.168.1.50", port=8443 -> "192.168.1.50:8443"
-        effective_host = (
-            f"{config.host}:{config.port}" if config.port else config.host
-        )
+        effective_host = _effective_host(config)
         tedapi_kwargs = {
             "host": effective_host,
             "gw_pwd": config.gw_pwd,
@@ -2208,7 +2228,7 @@ class GatewayManager:
         if settings.cache_file:
             tedapi_kwargs["cachefile"] = settings.cache_file
         if settings.siteid:
-            tedapi_kwargs["siteid"] = settings.siteid
+            tedapi_kwargs["siteid"] = _siteid_kwarg(settings.siteid)
         if config.rsa_key_path:
             tedapi_kwargs["rsa_key_path"] = config.rsa_key_path
         if config.wifi_host:
@@ -2254,15 +2274,17 @@ class GatewayManager:
         connect(), #155) counts as a failed probe instead of skipping
         silently.  Recovery builds a fresh connection the same way startup
         does (_create_local_connection) and swaps it in only if it comes up
-        in TEDAPI mode and reports a version; the existing connection keeps
-        serving until then.  connect() on the drifted object would resume
-        from cloud mode — the library restores the configured mode only
-        when every mode fails (#366 in pypowerwall), so it can't recover.
+        in TEDAPI mode and reports a version, so the existing connection
+        keeps serving until a verified replacement exists (reconnecting the
+        drifted object in place would leave nothing serving meanwhile).  The
+        replaced connection is dropped, not closed: the local client's
+        close_session() logs its token out at the gateway, and the fresh
+        connection reuses that token from the shared auth cache file.
 
-        Hybrid-mode note: a hybrid connection (v1r + WiFi fallback) has
-        pw.tedapi set, so its probes run against the local API; a WiFi
-        TEDAPI outage might not be detected.  Monitoring is best-effort for
-        hybrid; pure TEDAPI mode gets full coverage.
+        v1r + WiFi note: that connection has pw.tedapi set, so its probes
+        run against the wired LAN; a WiFi TEDAPI outage might not be
+        detected.  Monitoring is best-effort there; TEDAPI over WiFi alone
+        gets full coverage.
         """
         from app.config import settings
 
@@ -2283,13 +2305,6 @@ class GatewayManager:
                     continue
 
                 if not state["is_fallback_mode"]:
-                    # PW3 Basic LAN (host + password) has no TEDAPI client
-                    # at all, so there is nothing to probe.
-                    gateway = self.gateways.get(gateway_id)
-                    if gateway is not None and gateway.basic_lan:
-                        self._tedapi_probe_failures[gateway_id] = 0
-                        continue
-
                     # Probe based on configuration: a connection that is no
                     # longer in TEDAPI mode counts as a failed probe instead
                     # of skipping silently — skipping once held a gateway on
@@ -2365,11 +2380,9 @@ class GatewayManager:
                         if config is None:
                             raise RuntimeError("no stored configuration")
                         # Fresh connection, built the same way the lazy init
-                        # builds the first one.  connect() on the drifted
-                        # object would resume from cloud mode and cannot
-                        # recover (#155).  Swap it in only if it comes up in
-                        # TEDAPI mode and reports a version, so the current
-                        # connection keeps serving otherwise.
+                        # builds the first one.  Swap it in only if it comes
+                        # up in TEDAPI mode and reports a version, so the
+                        # current connection keeps serving otherwise.
                         fresh_pw = await self._create_local_connection(config)
                         verify_version = None
                         if getattr(fresh_pw, "tedapi", None):
@@ -2537,6 +2550,47 @@ class GatewayManager:
                     return v
         return conn
 
+    async def _locked_call(
+        self,
+        func: Callable[[], Any],
+        timeout: float,
+        on_dispatch: Optional[Callable[[asyncio.Future], None]] = None,
+    ) -> Any:
+        """Run a write (or a locked read) in the executor under _write_lock.
+
+        The lock is released when the library call finishes, not when we stop
+        waiting: after a timeout, or a cancelled request, the call keeps
+        running in its worker thread, and the next write must not overlap it
+        (two writes to the same site would race). ``timeout`` covers waiting
+        for the lock, for a free worker and for the call: a write whose time
+        runs out before its worker starts it raises asyncio.TimeoutError and
+        never reaches the site after its caller gave up. ``on_dispatch`` sees
+        the future right after submission (islanding's cooldown bookkeeping).
+        """
+        deadline = time.monotonic() + timeout
+
+        def run_if_in_time():
+            # The shared executor may be busy with reads: check again when
+            # a worker picks the call up
+            if time.monotonic() >= deadline:
+                raise asyncio.TimeoutError("expired before a worker started it")
+            return func()
+
+        await asyncio.wait_for(self._write_lock.acquire(), timeout=timeout)
+        try:
+            future = asyncio.get_running_loop().run_in_executor(
+                self._executor, run_if_in_time
+            )
+        except BaseException:
+            self._write_lock.release()
+            raise
+        future.add_done_callback(lambda _done: self._write_lock.release())
+        if on_dispatch is not None:
+            on_dispatch(future)
+        return await asyncio.wait_for(
+            asyncio.shield(future), timeout=deadline - time.monotonic()
+        )
+
     async def call_api(
         self,
         gateway_id: str,
@@ -2594,13 +2648,9 @@ class GatewayManager:
                 f"[{gateway_id}] call_api({method}) starting (timeout={timeout}s)"
             )
             if method in _WRITE_METHODS:
-                async with self._write_lock:
-                    result = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            self._executor, lambda: method_func(*args, **kwargs)
-                        ),
-                        timeout=timeout,
-                    )
+                result = await self._locked_call(
+                    lambda: method_func(*args, **kwargs), timeout
+                )
             else:
                 result = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -2759,13 +2809,9 @@ class GatewayManager:
             method_func = getattr(self._cloud_control, method)
             loop = asyncio.get_running_loop()
             if method in _WRITE_METHODS:
-                async with self._write_lock:
-                    result = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            self._executor, lambda: method_func(*args, **kwargs)
-                        ),
-                        timeout=timeout,
-                    )
+                result = await self._locked_call(
+                    lambda: method_func(*args, **kwargs), timeout
+                )
             else:
                 result = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -2867,15 +2913,11 @@ class GatewayManager:
         try:
             method_func = getattr(pw, method)
             loop = asyncio.get_running_loop()
-            if method in _WRITE_METHODS:
-                lock = self._write_lock
-                await lock.acquire()
-                release_lock = True
-                try:
-                    future = loop.run_in_executor(
-                        self._executor, lambda: method_func(*args, **kwargs)
-                    )
-                    if method in _ISLANDING_METHODS:
+            if method in _WRITE_METHODS or method in _LOCKED_READS:
+                on_dispatch = None
+                if method in _ISLANDING_METHODS:
+
+                    def on_dispatch(future):
                         # Cooldown clock starts at dispatch — a failed or
                         # timed-out contactor command still counts, because
                         # the gateway may have acted on it.
@@ -2890,22 +2932,10 @@ class GatewayManager:
                                 self._islanding_futures.pop(gateway_id, None)
 
                         future.add_done_callback(clear_after_completion)
-                    try:
-                        result = await asyncio.wait_for(
-                            asyncio.shield(future), timeout=timeout
-                        )
-                    except asyncio.TimeoutError:
-                        if method in _ISLANDING_METHODS:
-                            release_lock = False
 
-                            def release_after_completion(_completed_future):
-                                lock.release()
-
-                            future.add_done_callback(release_after_completion)
-                        raise
-                finally:
-                    if release_lock:
-                        lock.release()
+                result = await self._locked_call(
+                    lambda: method_func(*args, **kwargs), timeout, on_dispatch
+                )
             else:
                 result = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -2946,8 +2976,6 @@ class GatewayManager:
         start, cloud failover) is not v1r.
         """
         try:
-            from app.mqtt.ha_discovery import is_v1r_gateway
-
             status = self.get_gateway(gateway_id)
             return is_v1r_gateway(
                 self.gateways.get(gateway_id),
@@ -3006,9 +3034,14 @@ class GatewayManager:
 
         if not settings.local_first or not self._is_confirmed_v1r(gateway_id):
             return None, None
+        status = self.cache.get(gateway_id)
         if (
             self._is_lan_failed(gateway_id)
             or self.connections.get(gateway_id) is None
+            # lan_failed only trips with a WiFi host and failover on; a
+            # failed last poll covers a dead LAN without them (cached state)
+            or status is None
+            or not status.online
         ):
             # Nothing dispatchable locally (local v1r writes are LAN-only):
             # decline and let the caller's historical dispatch run unchanged.

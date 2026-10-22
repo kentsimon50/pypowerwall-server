@@ -109,7 +109,8 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from app.utils.control import is_error_result, is_v1r_gateway  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,10 @@ class MqttPublisher:
     """Async MQTT publisher with persistent connection and reconnect logic."""
 
     def __init__(self):
+        # Last PackageSerialNumber seen per (gateway, battery index): a snapshot
+        # without it must not move the battery's HA entities back to the
+        # gateway device (#153)
+        self._battery_serials: Dict[Tuple[str, int], str] = {}
         self._client = None              # aiomqtt.Client instance (inside context)
         self._connected: bool = False    # True only while inside active async with
         self._connection_task: Optional[asyncio.Task] = None
@@ -201,6 +206,31 @@ class MqttPublisher:
                 pass
         logger.info("MQTT publisher stopped.")
 
+    def _battery_blocks(self, gateway_id: str, system_status: Optional[dict]) -> list:
+        """Battery blocks for discovery, with each battery's last known serial
+        filled in when this snapshot omits it, so its entities stay on their
+        own Home Assistant device (#153) across broker reconnects and
+        control-state republishes.
+
+        Serials are remembered by position. A serial this snapshot reports
+        at another position is forgotten at its old one first, so two
+        batteries never share a device after a reorder. Every block's serial
+        counts, including blocks without energy values (not announced).
+        """
+        batteries = _extract_battery_blocks(system_status)
+        reported = _reported_battery_serials(system_status)
+        for key, serial in list(self._battery_serials.items()):
+            if key[0] == gateway_id and reported.get(serial, key[1]) != key[1]:
+                del self._battery_serials[key]
+        for serial, index in reported.items():
+            self._battery_serials[(gateway_id, index)] = serial
+        for batt in batteries:
+            if not batt["serial"]:
+                batt["serial"] = self._battery_serials.get(
+                    (gateway_id, batt["index"])
+                )
+        return batteries
+
     def _control_announce_state(self, gateway_id: str) -> tuple:
         """(mask, writable, is_v1r): which control entities to announce.
 
@@ -262,8 +292,8 @@ class MqttPublisher:
 
             controls_mask, writable, is_v1r = self._control_announce_state(gateway_id)
 
-            batteries = _extract_battery_blocks(
-                status.data.system_status if status.data else None
+            batteries = self._battery_blocks(
+                gateway_id, status.data.system_status if status.data else None
             )
 
             payloads = build_discovery_payloads(
@@ -344,8 +374,8 @@ class MqttPublisher:
                     exc_info=True,
                 )
         controls_state = self._control_announce_state(gateway_id)
-        batteries = _extract_battery_blocks(
-            data.system_status if data else None
+        batteries = self._battery_blocks(
+            gateway_id, data.system_status if data else None
         )
         signature = discovery_signature(
             data.strings if data else None,
@@ -1221,9 +1251,6 @@ def _short(val: object, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def is_error_result(result: object) -> bool:
-    """True when a library response reports an error instead of a value."""
-    return isinstance(result, dict) and ("error" in result or "ERROR" in result)
 
 
 def _island_ack_ok(result: object) -> bool:
@@ -1270,7 +1297,6 @@ def _gateway_is_v1r(gateway_manager, gateway_id: str) -> bool:
     failover) is not v1r.
     """
     try:
-        from app.mqtt.ha_discovery import is_v1r_gateway
 
         status = gateway_manager.get_gateway(gateway_id)
         return is_v1r_gateway(
@@ -1375,6 +1401,22 @@ def _extract_battery_blocks(system_status: Optional[dict]) -> list:
             "serial": serial if isinstance(serial, str) and serial else None,
         })
     return batteries
+
+
+def _reported_battery_serials(system_status: Optional[dict]) -> Dict[str, int]:
+    """Serial -> 1-based battery_blocks position for every block reporting a
+    PackageSerialNumber (the same positions _extract_battery_blocks uses)."""
+    if not isinstance(system_status, dict):
+        return {}
+    blocks = system_status.get("battery_blocks")
+    if not isinstance(blocks, list):
+        return {}
+    reported = {}
+    for index, block in enumerate(blocks, start=1):
+        serial = block.get("PackageSerialNumber") if isinstance(block, dict) else None
+        if isinstance(serial, str) and serial:
+            reported[serial] = index
+    return reported
 
 
 # Module-level singleton — imported by gateway_manager and main.py
