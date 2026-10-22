@@ -65,7 +65,7 @@ from urllib.parse import parse_qs
 import psutil
 import pypowerwall
 from pypowerwall import parse_version
-from fastapi import APIRouter, HTTPException, Request, Response, Header
+from fastapi import APIRouter, HTTPException, Request, Response, Query, Header
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
