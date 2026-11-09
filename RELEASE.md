@@ -2,6 +2,220 @@
 
 ## Version History
 
+### [0.15.1] - Upcoming
+
+**Fixed:**
+- **Console HTML escaping** - gateway names, hosts, modes, firmware, errors,
+  alerts, string names and section headers now render as text. A gateway
+  error or config value containing markup could inject HTML or script into
+  the Console. (#199)
+- **Console and History headers no longer show a Power Flow link**, which only
+  reloaded the Console: opened directly, `/` redirects to `/console`. `/` is
+  unchanged, so existing iframe embeds keep working; `/example.html` shows how
+  to embed it. (#201)
+
+### [0.15.0] - 2026-11-08
+
+Opt-in cloud read fallback and signed WiFi-v1r, MQTT active alerts, cleanup of
+stale retained MQTT topics, and pypowerwall 0.24.0. Read **Changed** if you use
+MQTT or Home Assistant.
+
+**Changed:**
+- **Retained MQTT topics that stop being published are now cleared.** When a
+  retained topic stops being published while the gateway stays online (say, a
+  mode without that value, or a removed battery or string), the server deletes
+  it from the broker after 3 consecutive publishes without it, so Home
+  Assistant stops showing the last value as live. Nothing is cleared while the
+  gateway is offline or with `MQTT_RETAIN=no`, and topics from before a server
+  restart aren't tracked. Thanks @kochj23! (#197, #101)
+- **pypowerwall upgraded to 0.24.0** (from 0.22.2; `requirements.txt` pin and
+  `pyproject.toml` minimum). Library changes that reach server users:
+  - Lifetime `energy_imported` / `energy_exported` in `/api/meters/aggregates`
+    (and the MQTT grid energy sensors) no longer drop to 0 for one poll when a
+    fetch of the gateway's local API fails. Home Assistant read the dip as a
+    meter reset (jasonacox/pypowerwall#463).
+  - A TEDAPI read that times out waiting for its API lock serves cached data
+    only while it is recent (60 s with default settings), then fails. A
+    stalled gateway now shows as failed polls, so the server's backoff and
+    fallback can act, instead of frozen values (jasonacox/pypowerwall#468).
+  - The final connection error says why the configured mode failed
+    (jasonacox/pypowerwall#457), and Tesla auth on macOS uses TLS 1.2, which
+    fixes a `403` at site discovery (jasonacox/pypowerwall#455).
+
+**Added:**
+- **Cloud read fallback (`PW_CLOUD_READ_FALLBACK`)** - opt-in (`no` by
+  default). After three consecutive failed local polls, a local gateway reads
+  the Cloud-Mode data set from its bound Cloud/FleetAPI connection, every
+  `PW_CACHE_EXPIRE` (5 s default; at least 30 s for FleetAPI). Cloud reads run
+  on their own schedule, so a slow local retry doesn't pause them; local
+  retries keep their backoff. Needs `PW_EMAIL` and cloud auth, an unambiguous site
+  (`PW_SITEID`, `.pypowerwall.site`, a single-site account or a live FleetAPI
+  connection) and `PW_FAILOVER=yes`. The flag starts the cloud connection
+  but adds no cloud calls while local polls succeed. Read-only:
+  writes are unchanged. `online` stays true so Home Assistant keeps the
+  values; check `data_source`/`local_online` for where they come from.
+  Fallback reads count toward the cloud link health in `/stats` and the
+  Console.
+  Validated on a Powerwall 2 with Tesla cloud. Thanks @erikgieseler! (#187)
+- **`data_source` and `local_online`** on each gateway status (`/api/gateways`,
+  `/health`, `/stats`): `local`, `cloud` or `cache`, and whether the local link
+  is up, with or without the flag. With the flag on, `/health` reports
+  `degraded` (still HTTP 200) while a local gateway is served from cloud;
+  without it, `/health` is unchanged.
+- **Signed WiFi-v1r transport (`PW_WIFI_V1R_FALLBACK`)** - opt-in (`no` by
+  default), independent of `PW_LOCAL_FIRST`. After the library's v1r LAN
+  failover trips, a gateway with `PW_WIFI_HOST` and an RSA key uses signed
+  WiFi-v1r as its only leader route: reads, and reserve/mode/grid, max backup
+  and islanding writes, with no fallback to legacy WiFi TEDAPI. Each write
+  first runs a read-only probe; if it fails, value controls use their
+  historical path (cloud, which during a LAN outage may accept a write without
+  applying it, #149) and max backup/islanding return `503`. A dispatched write
+  stays final. No change without the flag. Reserve writes validated on a
+  Powerwall 2 over an ESP32 bridge, and read-only cold failover on 2x
+  Powerwall 3 (@jasonacox-sam); max backup and islanding were not exercised on
+  hardware. Thanks @erikgieseler! (#186)
+- **`/json` `soe_scaled`** - the Tesla-app-scaled battery level, the same value
+  as `/api/system_status/soe`, next to the raw `soe`/`soe_raw`, which are
+  unchanged. Thanks @erikgieseler! (#192)
+- **MQTT active alerts** - `{prefix}/{gw}/alerts` (a sorted JSON list of the
+  active alert names, the same list `/alerts` serves) and
+  `{prefix}/{gw}/alert_count`, plus a Home Assistant "Active Alerts"
+  diagnostic sensor: the count is its state, the names its `alerts`
+  attribute. Skipped when alerts couldn't be fetched, so a failed fetch never
+  reads as "no alerts". Thanks @kochj23! (#196, #178)
+
+**Fixed:**
+- **`/pod`, `/freq` and `/pw/battery_blocks` no longer return HTTP 500** when
+  `battery_blocks` is null or holds a null entry, or a config block has a null
+  `vin` (pypowerwall allows these). They're treated as empty or skipped, and
+  Powerwalls keep their PW numbers. Thanks @kochj23! (#198)
+- **MQTT controls no longer bind to the wrong Tesla site** after a configured
+  FleetAPI connection fails over to Cloud on a multi-site account. The
+  FleetAPI exemption now checks the live connection; the Cloud client would
+  use the account's first site. Set `PW_SITEID` in that case. (#187)
+- **Console Authorization Token spacing** - the collapsed token panel keeps
+  equal top and bottom padding; the expanded layout is unchanged. Thanks
+  @erikgieseler! (#193)
+- **Console narrow-screen layout** - the Daily Energy table compacts at
+  380 px instead of spilling out of its card; long alert names wrap and the
+  mobile alert card grows with its content; the Operating Mode / Battery
+  panels fit at 320 px. (#194)
+- **Multi-gateway Console separators** - section headers use the defined
+  `--border-color` token instead of the undefined `--border`, so they show
+  again. Thanks @erikgieseler! (#194)
+
+### [0.14.0] - 2026-10-28
+
+Optional HTTPS on port 8775, and battery dispatch now warns that it could void
+or limit your Tesla warranty. Nothing changes unless you set `PW_HTTPS=yes`.
+
+**Added:**
+- **HTTPS (optional): `PW_HTTPS=yes` also serves HTTPS on port 8775**
+  (`PW_HTTPS_PORT`), next to HTTP on 8675, so existing clients and health checks
+  are unchanged. The server generates a self-signed certificate once, unique to
+  this install, in `/data/tls` (else `data/tls`), or uses `PW_HTTPS_CERT` /
+  `PW_HTTPS_KEY`. Over HTTPS the power-flow cookies are `SameSite=None; Secure`
+  so the page works in an HTTPS iframe. `/stats` reports `PW_HTTPS_PORT`. (#188)
+
+**Changed:**
+- **Battery dispatch now boldly warns that it could void or limit your Tesla
+  Powerwall warranty.** The Powerwall warranty quoted in
+  [pypowerwall#450](https://github.com/jasonacox/pypowerwall/issues/450) gives
+  unlimited cycles only for solar self-consumption, time-based control and
+  backup; any other use is limited to 37.8 MWh of total energy throughput.
+  Added to the README and API.md warnings, the Console caution line, info popup
+  and confirmations, the 403 message and the startup warning. Thanks
+  @longzheng for spotting this and @BJReplay for working out what the limit
+  means in daily use. (#190)
+
+**Fixed:**
+- **`PW_HTTPS` did nothing.** The server accepted it and reported it in `/stats`
+  but always served plain HTTP; `PW_HTTPS=yes` now starts the HTTPS listener. (#188)
+
+### [0.13.1] - 2026-10-27
+
+Battery dispatch becomes a separate opt-in, with a clear "use at your own risk"
+warning, plus pypowerwall 0.22.2. Read **Changed** if you use battery dispatch.
+
+**Changed:**
+- **Battery dispatch is now opt-in: `PW_BATTERY_DISPATCH=yes`.** This is a
+  behavior change from 0.13.0. With only `PW_CONTROL_SECRET` set, the Console's
+  Battery Dispatch panel is hidden and `POST /control/dispatch` returns 403.
+  Set `PW_BATTERY_DISPATCH=yes` to turn it back on, **at your own risk**: a
+  dispatch overrides the backup reserve and grid export settings, and we have
+  no idea whether incorrect use could damage your home, your Powerwall system
+  or the grid. `POST /control/resume` works without it, so turning it off never
+  strands a running dispatch. The server logs a warning at startup when it's
+  on, and `/stats` reports it under `config`. (#185)
+- **pypowerwall upgraded to 0.22.2** (from 0.22.1; `requirements.txt` pin and
+  `pyproject.toml` minimum). Each accepted battery dispatch is now logged at
+  WARNING (action, watts, duration), and the library documents dispatch as use
+  at your own risk (jasonacox/pypowerwall#446).
+
+**Added:**
+- **Battery dispatch safeguards in the Console.** Every dispatch (charge,
+  discharge or 0 W) asks for confirmation, showing its risks, and the result
+  says when it is expected to end. Console durations are capped at 4 hours
+  (the API still accepts up to 86400 seconds). The panel shows one caution
+  line, with the full risks behind an info icon. (#185)
+- **"Use at your own risk" warning** for battery dispatch in README and API.md. (#185)
+
+**Fixed:**
+- **Battery dispatch success needs the gateway's acknowledgement for that
+  command** (matching power and duration, or `resume_battery_operation:
+  true`). Any other non-error reply was reported as success. (#185)
+
+### [0.13.0] - 2026-10-26
+
+Local battery dispatch from the API and the Console, a FleetAPI HTTP/1.1
+setting, MQTT grid voltage and current, and pypowerwall 0.22.1. No existing
+behavior changes.
+
+**Added:**
+- **Local battery dispatch** - authenticated `POST /control/dispatch`
+  (`power_watts`, `duration_seconds`) and `POST /control/resume`, JSON or the
+  proxy's form fields, for timed battery power over the local v1r connection.
+  Positive watts discharge, negative watts charge; durations are 1-86400
+  seconds, and the gateway returns to its configured mode when one ends. Always
+  local, even in hybrid cloud mode, and serialized with every other write
+  under the gateway write lock, including across timeouts. `/control/status`
+  gains `battery_dispatch` (the default gateway's live v1r connection, no
+  gateway I/O). The Console's Control card gets a **Battery Dispatch** panel
+  that asks for confirmation before a discharge. **A dispatch overrides the
+  backup reserve and the export setting:** on a Powerwall 2 (Backup Gateway 1)
+  a discharge with the reserve at 100% and export `pv_only`/`never` still ran
+  and exported. Validated on Powerwall 2 through this server (discharge,
+  charge throttling, `0` W hold, resume) and on Powerwall 3 through
+  pypowerwall; README/API.md list what isn't verified yet. Thanks
+  @longzheng, tested by @BJReplay. (#180)
+- **`PW_FLEETAPI_HTTP` setting** - `1.1` forces HTTP/1.1 for all Tesla
+  FleetAPI requests (default: HTTP/2), an escape hatch for the intermittent
+  HTTP/2 connection-reuse errors (`COMPRESSION_ERROR`, h2 state errors) seen on
+  some sites (jasonacox/pypowerwall#436). `/stats` reports it under `config`,
+  as the proxy does. Thanks @jasonacox-sam. (#181)
+- **MQTT grid voltage and current** - `{prefix}/{gw}/grid_voltage` (V) and
+  `{prefix}/{gw}/grid_current` (A) from the site CT averages in
+  `/api/meters/aggregates`, also in the `status` JSON, with Home Assistant
+  Grid Voltage and Grid Current sensors. No new gateway requests. A gateway
+  that doesn't report a value gets neither the topic nor the entity. On TEDAPI
+  the current is grid power divided by voltage, so it is signed like grid power
+  (negative = exporting); the Powerwall 2 local API passes through the
+  gateway's value. Thanks @jasonacox-sam, requested by @ChrisJ60. (#179, #177)
+
+**Changed:**
+- **pypowerwall upgraded to 0.22.1** (from 0.21.0; `requirements.txt` pin and
+  `pyproject.toml` minimum). Library changes that reach server users:
+  - The battery dispatch methods the endpoints above use
+    (jasonacox/pypowerwall#440).
+  - TEDAPI `/api/system_status` on Powerwall 2 fills
+    `instantaneous_max_charge_power` and `instantaneous_max_discharge_power`,
+    which were `0`, and `/vitals` `TEPOD--` blocks carry
+    `POD_available_charge_power` and `POD_available_dischg_power`
+    (jasonacox/pypowerwall#429).
+  - FleetAPI: concurrent identical requests share one in-flight request, and
+    Tesla's 429 retry guidance opens a shared backoff window instead of a
+    request storm (jasonacox/pypowerwall#436).
+
 ### [0.12.0] - 2026-10-19
 
 The server now answers the legacy proxy's API the way the proxy does, so a

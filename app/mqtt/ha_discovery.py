@@ -17,6 +17,8 @@ Sensors (numeric):
     battery_raw — Raw battery charge (%)
     solar       — Solar power (W, device_class=power)
     grid        — Grid power (W, device_class=power, positive=importing)
+    grid_voltage — Grid voltage (V, device_class=voltage, site CT average)
+    grid_current — Grid current (A, device_class=current; TEDAPI: signed like grid power)
     home        — Home load (W, device_class=power)
     powerwall   — Powerwall power (W, device_class=power, positive=discharging)
     reserve     — Backup reserve target (%)
@@ -76,6 +78,8 @@ Binary sensor:
 
 Numeric sensors:
     time_remaining — Backup time remaining (h, device_class=duration)
+    alerts         — Active alert count (diagnostic); the alert names are in
+                     its "alerts" attribute (from the {gw}/alerts JSON list)
 
 Controls (MQTT_CONTROLS bitmask + PW_CONTROL_SECRET set, broker-trust;
 only bits in the mask are announced — 1 reserve, 2 mode, 4 grid_charging,
@@ -238,6 +242,7 @@ def discovery_signature(
     vitals: Optional[Dict[str, Any]],
     device_signals: Optional[Dict[str, Dict[str, float]]] = None,
     batteries: Optional[Sequence[Dict[str, Any]]] = None,
+    grid_metrics: Optional[Sequence[str]] = None,
 ) -> frozenset:
     """The optional (data-dependent) entities a snapshot would announce.
 
@@ -252,6 +257,10 @@ def discovery_signature(
     blocks are announced without waiting for a broker reconnect.
     """
     signature = set()
+    # Grid voltage/current sensors are only announced when the gateway
+    # reports the site CT-average fields (#177); the scalar topics are
+    # gated the same way in the publisher.
+    signature.update(("grid_metric", m) for m in grid_metrics or ())
     if isinstance(strings, dict):
         signature.update(("string", sid) for sid in strings)
     for din, cts in extract_remote_meters(vitals).items():
@@ -323,6 +332,7 @@ def build_discovery_payloads(
     controls: int = 0,
     writable: bool = False,
     is_v1r: bool = False,
+    grid_metrics: Optional[Sequence[str]] = None,
 ) -> list[tuple[str, str]]:
     """Build all HA auto-discovery (topic, payload) pairs for a gateway.
 
@@ -359,6 +369,11 @@ def build_discovery_payloads(
                    FleetAPI, bound hybrid cloud or v1r); those four need it.
         is_v1r:    The gateway uses the v1r transport; the islanding buttons
                    (PW2 and PW3) need it.
+        grid_metrics:  Grid health metrics the gateway actually reports
+                       (subset of {"grid_voltage", "grid_current"} from the
+                       site CT averages, #177).  Sensors whose metric is not
+                       reported get no entity, matching the topics actually
+                       published.
 
     Returns:
         List of (topic, json_payload_str) tuples, one per sensor/binary sensor/control.
@@ -389,6 +404,8 @@ def build_discovery_payloads(
         icon: Optional[str] = None,
         entity_category: Optional[str] = None,
         device_override: Optional[dict] = None,
+        json_attributes_topic: Optional[str] = None,
+        json_attributes_template: Optional[str] = None,
     ) -> tuple[str, str]:
         """Build a single numeric/text sensor discovery entry."""
         unique_id = f"pypowerwall_{gateway_id}_{uid_suffix}"
@@ -411,6 +428,10 @@ def build_discovery_payloads(
             payload["icon"] = icon
         if entity_category:
             payload["entity_category"] = entity_category
+        if json_attributes_topic:
+            payload["json_attributes_topic"] = json_attributes_topic
+        if json_attributes_template:
+            payload["json_attributes_template"] = json_attributes_template
         return disc_topic, json.dumps(payload)
 
     def binary_sensor(
@@ -586,6 +607,31 @@ def build_discovery_payloads(
             state_class="measurement",
             icon="mdi:transmission-tower",
         ),
+        # Grid health sensors from the site CT averages (#177) — only
+        # announced when the gateway reports the fields, so unsupported
+        # gateways don't get unknown HA entities.
+        *(
+            [sensor(
+                "grid_voltage", "Grid Voltage",
+                f"{data_prefix}/grid_voltage",
+                unit="V",
+                device_class="voltage",
+                state_class="measurement",
+                icon="mdi:sine-wave",
+            )]
+            if "grid_voltage" in (grid_metrics or ()) else []
+        ),
+        *(
+            [sensor(
+                "grid_current", "Grid Current",
+                f"{data_prefix}/grid_current",
+                unit="A",
+                device_class="current",
+                state_class="measurement",
+                icon="mdi:current-ac",
+            )]
+            if "grid_current" in (grid_metrics or ()) else []
+        ),
         sensor(
             "home", "Home Load",
             f"{data_prefix}/home",
@@ -747,6 +793,18 @@ def build_discovery_payloads(
             device_class="duration",
             state_class="measurement",
             icon="mdi:timer-outline",
+        ),
+        # --- Active alerts (#178): count as state, list as attribute ---
+        sensor(
+            "alerts", "Active Alerts",
+            f"{data_prefix}/alert_count",
+            unit=None,
+            device_class=None,
+            state_class="measurement",
+            icon="mdi:alert-circle-outline",
+            entity_category="diagnostic",
+            json_attributes_topic=f"{data_prefix}/alerts",
+            json_attributes_template="{{ {'alerts': value_json} | tojson }}",
         ),
     ]
 

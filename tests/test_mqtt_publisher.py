@@ -1082,6 +1082,69 @@ class TestExtractEnergy:
         assert _extract_energy(None, "site", "energy_imported") is None
 
 
+class TestGridVoltageCurrentTopics:
+    """Dedicated grid voltage/current scalar topics from site CT averages (#177)."""
+
+    def _make_publisher(self, monkeypatch) -> MqttPublisher:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "mqtt_host", "localhost")
+        monkeypatch.setattr(settings, "mqtt_port", 1883)
+        monkeypatch.setattr(settings, "mqtt_topic_prefix", "pypowerwall")
+        monkeypatch.setattr(settings, "mqtt_qos", 1)
+        monkeypatch.setattr(settings, "mqtt_retain", True)
+        return MqttPublisher()
+
+    def _status_with_grid_vc(self) -> GatewayStatus:
+        status = make_status()
+        status.data.aggregates["site"]["instant_average_voltage"] = 240.16
+        status.data.aggregates["site"]["instant_average_current"] = -12.44
+        return status
+
+    @pytest.mark.asyncio
+    async def test_grid_voltage_current_published(self, monkeypatch):
+        """Voltage and current get their own scalar topics, signed like grid power."""
+        pub = self._make_publisher(monkeypatch)
+        mock_client = AsyncMock()
+        pub._client = mock_client
+        pub._connected = True
+
+        await pub.publish_gateway("test-gw", self._status_with_grid_vc())
+
+        published = {c.args[0]: c.args[1] for c in mock_client.publish.call_args_list}
+        assert published["pypowerwall/test-gw/grid_voltage"] == "240.16"
+        assert published["pypowerwall/test-gw/grid_current"] == "-12.44"
+
+    @pytest.mark.asyncio
+    async def test_grid_voltage_current_absent_when_missing(self, monkeypatch):
+        """Legacy aggregates without the CT-average fields publish no topics."""
+        pub = self._make_publisher(monkeypatch)
+        mock_client = AsyncMock()
+        pub._client = mock_client
+        pub._connected = True
+
+        await pub.publish_gateway("test-gw", make_status())
+
+        published = [c.args[0] for c in mock_client.publish.call_args_list]
+        assert "pypowerwall/test-gw/grid_voltage" not in published
+        assert "pypowerwall/test-gw/grid_current" not in published
+
+    @pytest.mark.asyncio
+    async def test_grid_voltage_current_in_summary(self, monkeypatch):
+        """The status JSON carries the same two readings."""
+        pub = self._make_publisher(monkeypatch)
+        mock_client = AsyncMock()
+        pub._client = mock_client
+        pub._connected = True
+
+        await pub.publish_gateway("test-gw", self._status_with_grid_vc())
+
+        published = {c.args[0]: c.args[1] for c in mock_client.publish.call_args_list}
+        summary = json.loads(published["pypowerwall/test-gw/status"])
+        assert summary["grid_voltage"] == 240.16
+        assert summary["grid_current"] == -12.44
+
+
 class TestGridBackupTopics:
     """Publisher coverage for grid_connected/grid_charging/grid_export/time_remaining."""
 
@@ -1644,3 +1707,60 @@ class TestMqttDeviceSignalTopics:
             if c.args[0].startswith("homeassistant/") and "_device_" in c.args[0]
         ]
         assert second == first  # no duplicates
+
+
+# ---------------------------------------------------------------------------
+# Active alerts (#178)
+# ---------------------------------------------------------------------------
+
+
+class TestAlertTopics:
+    def _publisher(self, monkeypatch) -> MqttPublisher:
+        from app.config import settings
+        monkeypatch.setattr(settings, "mqtt_host", "localhost")
+        monkeypatch.setattr(settings, "mqtt_topic_prefix", "pypowerwall")
+        monkeypatch.setattr(settings, "mqtt_qos", 1)
+        monkeypatch.setattr(settings, "mqtt_retain", True)
+        monkeypatch.setattr(settings, "mqtt_ha_discovery", False)
+        pub = MqttPublisher()
+        pub._client = AsyncMock()
+        pub._connected = True
+        return pub
+
+    @staticmethod
+    def _published(pub) -> dict:
+        return {c.args[0]: c.args[1] for c in pub._client.publish.call_args_list}
+
+    @pytest.mark.asyncio
+    async def test_alerts_published_sorted_and_counted(self, monkeypatch):
+        pub = self._publisher(monkeypatch)
+        status = make_status()
+        status.data.alerts = ["SystemConnectedToGrid", "FWUpdateSucceeded",
+                              "SystemConnectedToGrid"]
+        await pub.publish_gateway("test-gw", status)
+        published = self._published(pub)
+        assert json.loads(published["pypowerwall/test-gw/alerts"]) == [
+            "FWUpdateSucceeded", "SystemConnectedToGrid"
+        ]
+        assert published["pypowerwall/test-gw/alert_count"] == "2"
+
+    @pytest.mark.asyncio
+    async def test_empty_alert_list_published(self, monkeypatch):
+        pub = self._publisher(monkeypatch)
+        status = make_status()
+        status.data.alerts = []
+        await pub.publish_gateway("test-gw", status)
+        published = self._published(pub)
+        assert published["pypowerwall/test-gw/alerts"] == "[]"
+        assert published["pypowerwall/test-gw/alert_count"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_unfetched_alerts_not_published(self, monkeypatch):
+        """None means the fetch failed - never publish it as 'no alerts'."""
+        pub = self._publisher(monkeypatch)
+        status = make_status()
+        status.data.alerts = None
+        await pub.publish_gateway("test-gw", status)
+        published = self._published(pub)
+        assert "pypowerwall/test-gw/alerts" not in published
+        assert "pypowerwall/test-gw/alert_count" not in published

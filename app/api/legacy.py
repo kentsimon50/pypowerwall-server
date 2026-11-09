@@ -25,7 +25,7 @@ Auth Routes (powerflow web app compatibility):
     - POST /api/login/Basic -> Fake login; sets long-lived AuthCookie/UserRecord
 
 Control Routes (require authentication, except status):
-    - GET /control/status -> Control availability (unauthenticated, {"enabled": bool})
+    - GET /control/status -> Control availability and default-gateway capabilities
     - POST /control/{path} -> Control operations (reserve, mode, etc.)
 
 Tesla Cloud Routes (server-only; not in the pypowerwall proxy):
@@ -56,6 +56,7 @@ Adding New Endpoints:
 """
 import asyncio
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta
@@ -199,18 +200,42 @@ def powerwall_unit_labels(
     return labels
 
 
-@router.get("/control/status")
-async def control_status():
-    """Control availability for the Console WebGUI (unauthenticated).
+def _dispatch_acknowledged(method: str, args: tuple, result: Any) -> bool:
+    """True if result acknowledges this command: matching power and duration
+    for a dispatch, resume_battery_operation True for a resume."""
+    if not isinstance(result, dict) or is_error_result(result):
+        return False
+    if method == "dispatch_battery_power":
+        watts, seconds = result.get("power_watts"), result.get("duration_seconds")
+        # bool is an int in Python (False == 0, True == 1): not an ack
+        return (
+            not isinstance(watts, bool)
+            and not isinstance(seconds, bool)
+            and watts == args[0]
+            and seconds == args[1]
+        )
+    return result.get("resume_battery_operation") is True
 
-    Returns only ``{"enabled": bool}`` derived from
-    ``settings.control_enabled`` (i.e. ``PW_CONTROL_SECRET`` is set).
-    Deliberately contains no secret and no gateway details because
-    ``/console`` and ``/stats`` are unauthenticated — the browser needs
-    to know *whether* to show the Control card without learning the token.
-    All actual writes stay behind ``verify_control_token``.
+
+@router.get("/control/status")
+async def control_status() -> Dict[str, bool]:
+    """Control availability for the Console (unauthenticated, booleans only).
+
+    battery_dispatch: opted in (PW_BATTERY_DISPATCH) and the default gateway's
+    live connection is v1r. No gateway I/O.
     """
-    return {"enabled": settings.control_enabled}
+    enabled = settings.control_enabled
+    battery_dispatch = False
+    if enabled and settings.battery_dispatch:
+        try:
+            # Use the same gateway selection and live-connection check as the
+            # dispatch endpoints. /stats aggregates modes across all gateways
+            # and can describe a different gateway in a multi-gateway setup.
+            battery_dispatch = _is_v1r(get_default_gateway())
+        except HTTPException:
+            # The Console must still load before any gateway is configured.
+            pass
+    return {"enabled": enabled, "battery_dispatch": battery_dispatch}
 
 
 # The proxy's control API (pypowerwall proxy/server.py), so proxy clients such
@@ -367,7 +392,7 @@ async def _proxy_form_control(
         return _proxy_response({"unauthorized": "Control Command Token Invalid"})
 
     action, value = path, field("value")
-    if not value:
+    if not value and action not in ("dispatch", "resume"):
         read = await _proxy_read(action)
         if read is None:
             read = {"error": "Invalid Command Action"}
@@ -375,7 +400,17 @@ async def _proxy_form_control(
 
     invalid = {"error": "Control Command Value Invalid"}
     success = None  # the proxy's fixed reply for some writes, else the result
-    if action == "reserve":
+    if action == "dispatch":
+        try:
+            data = {
+                "power_watts": float(field("power_watts")),
+                "duration_seconds": int(field("duration_seconds")),
+            }
+        except (ValueError, OverflowError):
+            return _proxy_response({"error": "Invalid battery dispatch parameters"})
+    elif action == "resume":
+        data = {}
+    elif action == "reserve":
         if not _digits(value):
             return _proxy_response(invalid)
         data = {"value": int(value)}
@@ -446,6 +481,13 @@ async def control_islanding(
     method = "go_off_grid" if value == "off_grid" else "reconnect_grid"
     kwargs = {"confirm": True} if value == "off_grid" else {}
     try:
+        # Check the shared islanding safety state before awaiting the probe:
+        # an in-flight command may finish during the probe otherwise.
+        gateway_manager.check_islanding_safety(gateway_id)
+        if not await gateway_manager.wifi_v1r_write_allowed(gateway_id):
+            raise HTTPException(
+                status_code=503, detail="WiFi v1r unavailable for islanding"
+            )
         result = await gateway_manager.local_control(
             gateway_id, method, timeout=10.0, **kwargs
         )
@@ -499,13 +541,36 @@ _CONTROL_REQUEST_BODY = {
                     "type": "object",
                     "properties": {
                         name: {"type": "string"}
-                        for name in ("value", "token", "mode", "level")
+                        for name in (
+                            "value",
+                            "token",
+                            "mode",
+                            "level",
+                            "power_watts",
+                            "duration_seconds",
+                        )
                     },
                 }
             },
         },
     }
 }
+
+
+@router.post("/control/dispatch", openapi_extra=_CONTROL_REQUEST_BODY)
+async def control_dispatch(
+    request: Request, authorization: Optional[str] = Header(None)
+) -> Any:
+    """Set battery power temporarily through the local v1r connection."""
+    return await control_api("dispatch", request, authorization)
+
+
+@router.post("/control/resume", openapi_extra=_CONTROL_REQUEST_BODY)
+async def control_resume(
+    request: Request, authorization: Optional[str] = Header(None)
+) -> Any:
+    """Release a local battery dispatch and resume the configured mode."""
+    return await control_api("resume", request, authorization)
 
 
 @router.post("/control/{path:path}", openapi_extra=_CONTROL_REQUEST_BODY)
@@ -574,6 +639,58 @@ async def _control_json(path: str, data: dict):
     """Validate and run one authenticated control request (the JSON API; the
     proxy form API maps onto it). Raises HTTPException on bad input or a
     failed write."""
+
+    if path in ("dispatch", "resume"):
+        # Dispatch is opt-in; resume isn't, so turning the opt-in off can't
+        # strand a running dispatch.
+        if path == "dispatch" and not settings.battery_dispatch:
+            raise HTTPException(
+                status_code=403,
+                detail="Battery dispatch is off. Set PW_BATTERY_DISPATCH=yes "
+                "to enable it (use at your own risk; it could void your warranty).",
+            )
+        args = ()
+        method = "resume_battery_operation"
+        if path == "dispatch":
+            watts, seconds = data.get("power_watts"), data.get("duration_seconds")
+            try:
+                valid_power = (
+                    isinstance(watts, (int, float))
+                    and not isinstance(watts, bool)
+                    and math.isfinite(watts)
+                )
+            except OverflowError:
+                valid_power = False
+            if (
+                not valid_power
+                or type(seconds) is not int
+                or not 1 <= seconds <= 86400
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="power_watts must be finite and duration_seconds "
+                    "must be an integer from 1 to 86400",
+                )
+            method, args = "dispatch_battery_power", (watts, seconds)
+        gateway_id = get_default_gateway()
+        if not _is_v1r(gateway_id):
+            raise HTTPException(
+                status_code=503,
+                detail="Battery dispatch requires v1r LAN transport",
+            )
+        # Timed dispatch always uses local RSA control, including in hybrid
+        # cloud mode. The shared write lock orders dispatch and resume even
+        # when a request times out while its worker is still running.
+        result = await gateway_manager.local_control(
+            gateway_id, method, *args, timeout=max(10.0, settings.timeout + 5.0)
+        )
+        if not _dispatch_acknowledged(method, args, result):
+            raise HTTPException(
+                status_code=503,
+                detail="Battery dispatch not confirmed by the gateway. Check "
+                "battery power before retrying.",
+            )
+        return result
 
     # Validate grid_charging requires an explicit boolean value to prevent
     # silent state changes from malformed or empty payloads.
@@ -751,6 +868,11 @@ async def _control_json(path: str, data: dict):
         else:
             method, args = "schedule_max_backup", (value,)
         async with _max_backup_lock:
+            if not await gateway_manager.wifi_v1r_write_allowed(gateway_id):
+                raise HTTPException(
+                    status_code=503,
+                    detail="WiFi v1r unavailable for max backup",
+                )
             result = await gateway_manager.local_control(
                 gateway_id, method, *args, timeout=_max_backup_timeout()
             )
@@ -922,8 +1044,16 @@ def get_default_gateway():
 _AUTH_COOKIE_MAX_AGE = 10 * 365 * 24 * 60 * 60  # 315360000 seconds
 
 
+def auth_cookie_options(request: Request) -> Dict[str, Any]:
+    """Auth cookie flags: SameSite=None; Secure over HTTPS (so power flow works
+    in an HTTPS iframe), SameSite=Lax over HTTP."""
+    if request.url.scheme == "https":
+        return {"samesite": "none", "secure": True}
+    return {"samesite": "lax"}
+
+
 @router.post("/api/login/Basic")
-async def post_login_basic(response: Response):
+async def post_login_basic(request: Request, response: Response):
     """Fake login endpoint for powerflow web app compatibility (issue #7).
 
     The Tesla Gateway web app (served from /powerflow) stores auth state in
@@ -934,19 +1064,20 @@ async def post_login_basic(response: Response):
     We return a synthetic success payload and set long-lived AuthCookie /
     UserRecord cookies so the browser never hits the login screen again.
     """
+    cookie = auth_cookie_options(request)
     response.set_cookie(
         key="AuthCookie",
         value="1234567890",
         max_age=_AUTH_COOKIE_MAX_AGE,
         path="/",
-        samesite="lax",
+        **cookie,
     )
     response.set_cookie(
         key="UserRecord",
         value="1234567890",
         max_age=_AUTH_COOKIE_MAX_AGE,
         path="/",
-        samesite="lax",
+        **cookie,
     )
     return {
         "email": "",
@@ -1060,6 +1191,8 @@ async def get_freq():
     # Map PackageSerialNumber → system_status battery block
     ss_block_map: dict = {}
     for block in (system_status.get("battery_blocks") or []):
+        if not isinstance(block, dict):
+            continue
         serial = block.get("PackageSerialNumber")
         if serial:
             ss_block_map[serial] = block
@@ -1085,7 +1218,9 @@ async def get_freq():
     tedapi_config = status.data.tedapi_config
     if isinstance(tedapi_config, dict):
         for cb in (tedapi_config.get("battery_blocks") or []):
-            vin = cb.get("vin", "")
+            if not isinstance(cb, dict):
+                continue
+            vin = cb.get("vin") or ""
             if "--" in vin:
                 part, serial = vin.rsplit("--", 1)
                 if serial and serial not in pw_serials:
@@ -1095,6 +1230,8 @@ async def get_freq():
     # Fall back to system_status ordering (non-TEDAPI modes, or when config unavailable)
     if not pw_serials:
         for block in (system_status.get("battery_blocks") or []):
+            if not isinstance(block, dict):
+                continue
             serial = block.get("PackageSerialNumber")
             if serial and serial not in pw_serials:
                 pw_serials.append(serial)
@@ -1504,10 +1641,13 @@ async def get_pod():
     # TEDAPI config battery_blocks carry a human-readable "type" field
     # ("Powerwall3", "Powerwall3Follower", etc.) that system_status does not.
     # VIN format: "PARTNUM--SERIAL" (e.g. "1707000-11-M--TG1253370033TB" → "TG1253370033TB")
+    # battery_blocks may be null (as pypowerwall allows), entries too.
     tedapi_type_map: dict = {}
-    if status.data.tedapi_config:
-        for cfg_block in status.data.tedapi_config.get("battery_blocks", []):
-            vin = cfg_block.get("vin", "")
+    if isinstance(status.data.tedapi_config, dict):
+        for cfg_block in status.data.tedapi_config.get("battery_blocks") or []:
+            if not isinstance(cfg_block, dict):
+                continue
+            vin = cfg_block.get("vin") or ""
             block_type = cfg_block.get("type")
             if vin and block_type and "--" in vin:
                 serial = vin.rsplit("--", 1)[1]
@@ -1518,9 +1658,15 @@ async def get_pod():
     expansion_parent_indexes = _expansion_parent_indexes(
         system_status, status.data.tedapi_config
     )
-    if system_status and "battery_blocks" in system_status:
-        idx = 1
-        for block in system_status["battery_blocks"]:
+    battery_blocks = []
+    if isinstance(system_status, dict):
+        battery_blocks = system_status.get("battery_blocks") or []
+    if battery_blocks:
+        # PW{idx} is the block's position in battery_blocks, as in
+        # powerwall_unit_labels() and _expansion_parent_indexes()
+        for idx, block in enumerate(battery_blocks, 1):
+            if not isinstance(block, dict):
+                continue
             # Initialize with None placeholders
             pod[f"PW{idx}_name"] = None
             pod[f"PW{idx}_POD_ActiveHeating"] = None
@@ -1571,7 +1717,6 @@ async def get_pod():
             pod[f"PW{idx}_backup_ready"] = int(block.get("backup_ready") or 0)
             pod[f"PW{idx}_OpSeqState"] = block.get("OpSeqState")
             pod[f"PW{idx}_version"] = block.get("version")
-            idx += 1
 
     # Augment with Vitals Data if available - match POD data to battery blocks by serial number
     if status.data.vitals:
@@ -1592,8 +1737,10 @@ async def get_pod():
                     tepod_map[serial] = (device, v)
         
         # Match TEPOD vitals to battery blocks by serial number
-        if system_status and "battery_blocks" in system_status:
-            for idx, block in enumerate(system_status["battery_blocks"], 1):
+        if battery_blocks:
+            for idx, block in enumerate(battery_blocks, 1):
+                if not isinstance(block, dict):
+                    continue
                 serial = block.get("PackageSerialNumber")
                 if serial and serial in tepod_map:
                     device_name, v = tepod_map[serial]
@@ -1645,6 +1792,7 @@ async def get_json():
             "battery": None,
             "soe": None,
             "soe_raw": None,
+            "soe_scaled": None,
             "grid_status": None,
             "reserve": None,
             "time_remaining_hours": None,
@@ -1660,6 +1808,7 @@ async def get_json():
     # Battery level: the raw gateway level, like the proxy's pw.level()
     soe_raw = status.data.soe_raw if status.data.soe_raw is not None else 0
     soe = soe_raw
+    soe_scaled = status.data.soe  # Tesla App scale: the value /api/system_status/soe returns
 
     # Convert grid_status to numeric (1=UP, 0=DOWN)
     grid_status_str = status.data.grid_status or "DOWN"
@@ -1686,6 +1835,7 @@ async def get_json():
         "battery": battery,
         "soe": soe,
         "soe_raw": soe_raw,
+        "soe_scaled": soe_scaled,
         "grid_status": grid_status,
         "reserve": reserve,
         "time_remaining_hours": time_remaining,
@@ -2414,7 +2564,9 @@ async def pw_battery_blocks():
 
     result: dict = {}
     for bat in status.data.system_status.get("battery_blocks") or []:
-        sn = bat.get("PackageSerialNumber")
+        sn = bat.get("PackageSerialNumber") if isinstance(bat, dict) else None
+        if not sn:
+            continue  # keyed by serial: a block without one has no slot
         result[sn] = {k: v for k, v in bat.items() if k != "PackageSerialNumber"}
 
     # Merge TETHC temperature/state from vitals (pw.battery_blocks behavior)
@@ -2804,6 +2956,8 @@ async def get_stats():
                 "name": gw.name,
                 "host": gw.host,
                 "online": status.online if status else False,
+                "data_source": status.data_source if status else None,
+                "local_online": status.local_online if status else None,
                 "last_error": status.error if status and status.error else None,
                 "last_updated": status.last_updated
                 if status and status.last_updated
@@ -2859,6 +3013,7 @@ async def get_stats():
         "PW_TIMEOUT": settings.timeout,
         "PW_POOL_MAXSIZE": settings.pool_maxsize,
         "PW_HTTPS": "yes" if settings.https_mode else "no",
+        "PW_HTTPS_PORT": settings.https_port,
         "PW_PORT": settings.server_port,
         "PW_STYLE": settings.style,
         "PW_SITEID": "**********" if settings.siteid else None,
@@ -2879,8 +3034,12 @@ async def get_stats():
         "PW_TEDAPI_AUTH_MODE": settings.tedapi_auth_mode,
         "PW_TEDAPI_API_VERSION": settings.tedapi_api_version,
         "PW_FAILOVER": settings.failover,
+        "PW_FLEETAPI_HTTP": settings.fleetapi_http or None,
+        "PW_BATTERY_DISPATCH": settings.battery_dispatch,
         "PW_CLOUD_HYBRID": settings.cloud_hybrid,
         "PW_LOCAL_FIRST": settings.local_first,
+        "PW_CLOUD_READ_FALLBACK": settings.cloud_read_fallback,
+        "PW_WIFI_V1R_FALLBACK": settings.wifi_v1r_fallback,
     }
 
     # Build connection health section
@@ -2949,6 +3108,7 @@ async def get_stats():
 
     # Add SolarOnly fallback mode state for each tracked gateway
     stats["fallback_mode"] = gateway_manager.get_all_fallback_states()
+    stats["cloud_read_fallback"] = gateway_manager.get_all_cloud_read_states()
 
     # Add default gateway info for backward compatibility
     if gateway_manager.gateways:

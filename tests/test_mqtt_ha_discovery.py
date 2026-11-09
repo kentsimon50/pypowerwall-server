@@ -26,9 +26,11 @@ from app.mqtt.ha_discovery import (
 from app.mqtt.publisher import MqttPublisher
 from app.models.gateway import Gateway, GatewayStatus, PowerwallData
 
-# Base entities every gateway announces: 20 sensors + 3 binary sensors.
-# Solar-string and remote-meter entities are added on top when reported.
-BASE_ENTITY_COUNT = 23
+# Base entities every gateway announces: 21 sensors + 3 binary sensors.
+# Solar-string, remote-meter and grid voltage/current entities are added on
+# top when reported (grid sensors only when the site CT-average fields are
+# present — #177).
+BASE_ENTITY_COUNT = 24
 
 
 # ---------------------------------------------------------------------------
@@ -69,13 +71,15 @@ def make_status(
 class TestBuildDiscoveryPayloads:
     def _payloads(self, gateway_id="home", gateway_name="Home Powerwall",
                   prefix="pypowerwall", ha_prefix="homeassistant",
-                  version="23.44.0") -> list[tuple[str, dict]]:
+                  version="23.44.0",
+                  grid_metrics=None) -> list[tuple[str, dict]]:
         raw = build_discovery_payloads(
             gateway_id=gateway_id,
             gateway_name=gateway_name,
             topic_prefix=prefix,
             ha_prefix=ha_prefix,
             version=version,
+            grid_metrics=grid_metrics,
         )
         return [(topic, json.loads(payload)) for topic, payload in raw]
 
@@ -144,6 +148,38 @@ class TestBuildDiscoveryPayloads:
         p = results[topic]
         assert p["unit_of_measurement"] == "W"
         assert p["device_class"] == "power"
+
+    def test_grid_voltage_current_sensor_fields(self):
+        """Grid health sensors from the site CT averages (#177)."""
+        results = dict(
+            self._payloads(grid_metrics=["grid_voltage", "grid_current"])
+        )
+        assert (
+            len(self._payloads(grid_metrics=["grid_voltage", "grid_current"]))
+            == BASE_ENTITY_COUNT + 2
+        )
+        checks = {
+            "grid_voltage": ("V", "voltage", "pypowerwall/home/grid_voltage"),
+            "grid_current": ("A", "current", "pypowerwall/home/grid_current"),
+        }
+        for uid, (unit, device_class, state_topic) in checks.items():
+            p = results[f"homeassistant/sensor/pypowerwall_home_{uid}/config"]
+            assert p["unit_of_measurement"] == unit, uid
+            assert p["device_class"] == device_class, uid
+            assert p["state_class"] == "measurement", uid
+            assert p["state_topic"] == state_topic, uid
+            assert p["unique_id"] == f"pypowerwall_home_{uid}", uid
+
+    def test_grid_voltage_current_absent_without_metrics(self):
+        """No grid health entities when the gateway lacks the CT-average
+        fields (#177) — avoids unknown HA entities."""
+        results = dict(self._payloads())
+        assert "homeassistant/sensor/pypowerwall_home_grid_voltage/config" not in results
+        assert "homeassistant/sensor/pypowerwall_home_grid_current/config" not in results
+        assert (
+            len(self._payloads(grid_metrics=["grid_voltage"]))
+            == BASE_ENTITY_COUNT + 1
+        )
 
     def test_battery_energy_sensor_fields(self):
         results = dict(self._payloads())
@@ -244,6 +280,18 @@ class TestBuildDiscoveryPayloads:
         assert p["unit_of_measurement"] == "h"
         assert p["device_class"] == "duration"
         assert p["state_class"] == "measurement"
+
+    def test_alerts_sensor_fields(self):
+        """Active alerts (#178): count as state, alert list as attribute."""
+        results = dict(self._payloads())
+        topic = "homeassistant/sensor/pypowerwall_home_alerts/config"
+        p = results[topic]
+        assert p["unique_id"] == "pypowerwall_home_alerts"
+        assert p["state_topic"] == "pypowerwall/home/alert_count"
+        assert p["json_attributes_topic"] == "pypowerwall/home/alerts"
+        assert "value_json" in p["json_attributes_template"]
+        assert p["entity_category"] == "diagnostic"
+        assert "unit_of_measurement" not in p
 
     def test_availability_references_correct_topic(self):
         results = self._payloads(gateway_id="main", prefix="pw")
